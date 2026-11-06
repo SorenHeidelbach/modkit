@@ -1,22 +1,35 @@
 use crate::mod_bam::{BaseModCall, BaseModProbs, SeqPosBaseModProbs, SkipMode};
 use crate::mod_base_code::{DnaBase, ModCodeRepr};
-use derive_new::new;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 
-#[derive(new, Clone)]
+#[derive(Clone)]
 pub struct MultipleThresholdModCaller {
-    per_base_thresholds: HashMap<DnaBase, f32>,
+    // FxHashMap: these are looked up for every base modification call, and
+    // only ever iterated for logging/reporting
+    per_base_thresholds: FxHashMap<DnaBase, f32>,
     // todo maybe allow this per primary base?
-    per_mod_thresholds: HashMap<ModCodeRepr, f32>,
+    per_mod_thresholds: FxHashMap<ModCodeRepr, f32>,
     default_threshold: f32,
 }
 
 impl MultipleThresholdModCaller {
+    pub fn new(
+        per_base_thresholds: HashMap<DnaBase, f32>,
+        per_mod_thresholds: HashMap<ModCodeRepr, f32>,
+        default_threshold: f32,
+    ) -> Self {
+        Self {
+            per_base_thresholds: per_base_thresholds.into_iter().collect(),
+            per_mod_thresholds: per_mod_thresholds.into_iter().collect(),
+            default_threshold,
+        }
+    }
+
     pub fn new_passthrough() -> Self {
         Self {
-            per_base_thresholds: HashMap::new(),
-            per_mod_thresholds: HashMap::new(),
+            per_base_thresholds: FxHashMap::default(),
+            per_mod_thresholds: FxHashMap::default(),
             default_threshold: 0f32,
         }
     }
