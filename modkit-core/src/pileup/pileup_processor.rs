@@ -1,13 +1,11 @@
 use std::{
-    cmp::Ordering, collections::HashMap, marker::PhantomData, ops::Range,
-    path::PathBuf,
+    collections::HashMap, marker::PhantomData, ops::Range, path::PathBuf,
 };
 
 use anyhow::{anyhow, bail};
 use bitvec::slice::BitSlice;
 use common_macros::hash_map;
 use itertools::Itertools;
-use rustc_hash::{FxHashMap, FxHashSet};
 use std::ops::BitOrAssign;
 
 use crate::{
@@ -23,7 +21,7 @@ use crate::{
     },
     motifs::motif_bed::MotifInfo,
     pileup::{
-        base_mods_adapter::{BaseModsAdapter, ModState},
+        base_mods_adapter::{decode_base, BaseModsAdapter, ModState},
         ModBasePileup2, PileupFeatureCounts2, PileupNumericOptions,
     },
     threshold_mod_caller::MultipleThresholdModCaller,
@@ -200,6 +198,7 @@ impl<
             }
 
             let reverse = record.is_reverse();
+            let seq_enc = record.seq().encoded;
             let read_length = record.seq_len();
             let Ok(mut modbase_iter) = BaseModsAdapter::<16>::new(&record)
             else {
@@ -320,7 +319,7 @@ impl<
                     // call
                     (Some(q), Some(mp)) if q < mp.mod_position => {
                         let base = {
-                            let Ok(tmp) = DnaBase::try_from(record.seq()[q])
+                            let Ok(tmp) = DnaBase::try_from(decode_base(seq_enc, q))
                             else {
                                 erred_records = erred_records.saturating_add(1);
                                 continue 'records;
@@ -364,7 +363,7 @@ impl<
                                             assert!(pos > q);
                                             let base = {
                                                 let tmp = DnaBase::try_from(
-                                                    record.seq()[q],
+                                                    decode_base(seq_enc, q),
                                                 )
                                                 .unwrap();
                                                 if record.is_reverse() {
@@ -390,7 +389,7 @@ impl<
                                 Ok(None) => {
                                     let base = {
                                         let tmp =
-                                            DnaBase::try_from(record.seq()[q])
+                                            DnaBase::try_from(decode_base(seq_enc, q))
                                                 .unwrap();
                                         if record.is_reverse() {
                                             tmp.complement()
@@ -414,7 +413,7 @@ impl<
                     (Some(q), None) => {
                         let base = {
                             let tmp =
-                                DnaBase::try_from(record.seq()[q]).unwrap();
+                                DnaBase::try_from(decode_base(seq_enc, q)).unwrap();
                             if record.is_reverse() {
                                 tmp.complement()
                             } else {
@@ -490,6 +489,7 @@ pub struct GenericPileupWorker {
     pileup_numeric_options: PileupNumericOptions,
     combine_strands: bool,
     max_depth: u16,
+    tally_table: TallyTable,
 }
 
 impl GenericPileupWorker {
@@ -545,6 +545,7 @@ impl GenericPileupWorker {
             pileup_numeric_options,
             combine_strands,
             max_depth,
+            tally_table: TallyTable::default(),
         })
     }
 }
@@ -581,8 +582,10 @@ impl PileupWorker for GenericPileupWorker {
             // TODO: Capture errors here. Also check for partition-tag
             .filter_map(|res| res.ok());
 
-        let mut chrom_features: FxHashMap<PositionStrand, Tally2> =
-            FxHashMap::default();
+        // dense, reused tally table indexed by (relative position, strand),
+        // replaces a per-interval hash map keyed on position/strand
+        let tally_table = &mut self.tally_table;
+        tally_table.reset(width);
         let mut add_to_tally = |position_strand: PositionStrand,
                                 call: Call,
                                 motif_info: Option<&MotifInfo>,
@@ -619,10 +622,12 @@ impl PileupWorker for GenericPileupWorker {
                 _ => position_strand,
             };
 
-            chrom_features
-                .entry(position_strand)
-                .or_insert_with(Tally2::default)
-                .add_call(call, motif_idxs, self.max_depth);
+            tally_table.add_call(
+                position_strand,
+                call,
+                motif_idxs,
+                self.max_depth,
+            );
         };
 
         let mut mod_pos = Option::<usize>::None;
@@ -631,6 +636,7 @@ impl PileupWorker for GenericPileupWorker {
         let mut mod_strand = Option::<Strand>::None;
         'records: for record in records {
             let reverse = record.is_reverse();
+            let seq_enc = record.seq().encoded;
             let record_strand = if record.is_reverse() {
                 Strand::Negative
             } else {
@@ -756,7 +762,7 @@ impl PileupWorker for GenericPileupWorker {
                     }
                     (Some(q), Some(mp)) if q < mp => {
                         let base = {
-                            let Ok(tmp) = DnaBase::try_from(record.seq()[q])
+                            let Ok(tmp) = DnaBase::try_from(decode_base(seq_enc, q))
                             else {
                                 erred_records = erred_records.saturating_add(1);
                                 continue 'records;
@@ -767,15 +773,12 @@ impl PileupWorker for GenericPileupWorker {
                                 tmp
                             }
                         };
-                        if implicit_bases.contains(&base) {
+                        if implicit_bases[base as usize] {
                             add_to_tally(
                                 (rpos, record_strand),
                                 Call::CanonicalCall {
                                     primary_base: base,
-                                    mod_codes: bases_to_codes
-                                        .get(&base)
-                                        .cloned()
-                                        .unwrap_or_else(Vec::new),
+                                    mod_codes: &bases_to_codes[base as usize],
                                 },
                                 ref_base,
                                 motif_idxs,
@@ -862,7 +865,7 @@ impl PileupWorker for GenericPileupWorker {
                                     assert!(pos > q);
                                     let base = {
                                         let tmp =
-                                            DnaBase::try_from(record.seq()[q])
+                                            DnaBase::try_from(decode_base(seq_enc, q))
                                                 .unwrap();
                                         if record.is_reverse() {
                                             tmp.complement()
@@ -870,15 +873,13 @@ impl PileupWorker for GenericPileupWorker {
                                             tmp
                                         }
                                     };
-                                    if implicit_bases.contains(&base) {
+                                    if implicit_bases[base as usize] {
                                         add_to_tally(
                                             (rpos, record_strand),
                                             Call::CanonicalCall {
                                                 primary_base: base,
-                                                mod_codes: bases_to_codes
-                                                    .get(&base)
-                                                    .cloned()
-                                                    .unwrap(),
+                                                mod_codes: &bases_to_codes
+                                                    [base as usize],
                                             },
                                             ref_base,
                                             motif_idxs,
@@ -912,22 +913,19 @@ impl PileupWorker for GenericPileupWorker {
                     (Some(q), None) => {
                         let base = {
                             let tmp =
-                                DnaBase::try_from(record.seq()[q]).unwrap();
+                                DnaBase::try_from(decode_base(seq_enc, q)).unwrap();
                             if record.is_reverse() {
                                 tmp.complement()
                             } else {
                                 tmp
                             }
                         };
-                        if implicit_bases.contains(&base) {
+                        if implicit_bases[base as usize] {
                             add_to_tally(
                                 (rpos, record_strand),
                                 Call::CanonicalCall {
                                     primary_base: base,
-                                    mod_codes: bases_to_codes
-                                        .get(&base)
-                                        .cloned()
-                                        .unwrap(),
+                                    mod_codes: &bases_to_codes[base as usize],
                                 },
                                 ref_base,
                                 motif_idxs,
@@ -950,22 +948,15 @@ impl PileupWorker for GenericPileupWorker {
             PileupNumericOptions::Combine => true,
             _ => false,
         };
-        let position_feature_counts = chrom_features
-            .into_iter()
-            .sorted_by(|((x, a), _), ((y, b), _)| match x.cmp(y) {
-                Ordering::Equal => a.cmp(b),
-                o @ _ => o,
-            })
-            .flat_map(|((ref_pos, strand), tally)| {
-                tally.into_counts(
-                    start_pos,
-                    ref_pos,
-                    combine_mods,
-                    if self.combine_strands { '.' } else { strand.to_char() },
-                )
-            })
-            .filter(|x| x.is_valid())
-            .collect::<Vec<PileupFeatureCounts2>>();
+        let mut position_feature_counts =
+            std::mem::take(&mut pileup_space.position_feature_counts);
+        position_feature_counts.clear();
+        self.tally_table.decode_into(
+            start_pos,
+            combine_mods,
+            self.combine_strands,
+            &mut position_feature_counts,
+        );
 
         pileup_space.chrom_name = chrom_name;
         pileup_space.interval_width = width;
@@ -2196,48 +2187,44 @@ fn calc_offset_dyn<const STRANDS: usize>(
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum Call {
+#[derive(Clone, Copy, Debug)]
+pub enum Call<'a> {
     Delete,
     Filtered(DnaBase),
     NoCall(DnaBase),
     CanonicalCall {
         primary_base: DnaBase,
-        mod_codes: Vec<ModCodeRepr>,
+        mod_codes: &'a [ModCodeRepr],
     },
     ModifiedCall {
         primary_base: DnaBase,
         mod_code: ModCodeRepr,
-        mod_codes: Vec<ModCodeRepr>,
+        mod_codes: &'a [ModCodeRepr],
     },
 }
 
-impl Call {
+impl<'a> Call<'a> {
+    #[inline]
     fn from_basemodcall(
         base_mod_call: BaseModCall,
         primary_base: DnaBase,
-        bases_to_codes: &FxHashMap<DnaBase, Vec<ModCodeRepr>>,
+        bases_to_codes: &'a [Vec<ModCodeRepr>; 4],
     ) -> Self {
         match base_mod_call {
             BaseModCall::Canonical(_) => Call::CanonicalCall {
                 primary_base,
-                mod_codes: bases_to_codes
-                    .get(&primary_base)
-                    .cloned()
-                    .unwrap_or_else(Vec::new),
+                mod_codes: &bases_to_codes[primary_base as usize],
             },
             BaseModCall::Modified(_, mod_code) => Call::ModifiedCall {
                 primary_base,
                 mod_code,
-                mod_codes: bases_to_codes
-                    .get(&primary_base)
-                    .cloned()
-                    .unwrap_or_else(Vec::new),
+                mod_codes: &bases_to_codes[primary_base as usize],
             },
             BaseModCall::Filtered => Call::Filtered(primary_base),
         }
     }
 
+    #[inline]
     fn matches_dna_base(&self, ref_base: &DnaBase) -> bool {
         match self {
             Call::CanonicalCall { primary_base, .. }
@@ -2249,113 +2236,212 @@ impl Call {
     }
 }
 
-#[derive(Debug, Hash, Eq, PartialEq)]
-enum ModifiedBase {
-    UnModified,
-    Modified(ModCodeRepr),
-}
-
-#[derive(Debug, Default)]
-pub(super) struct Tally2 {
+/// Per (position, strand) counts that don't depend on the modification
+/// code. Kept small and `Copy` so the dense table is cheap to reset.
+#[derive(Debug, Default, Clone, Copy)]
+struct PositionCounts {
     total_cov: u16,
     n_delete: u16,
     n_filtered: [u16; 4],
     basecall_counts: [u16; 4],
-    modcall_counts: [FxHashMap<ModifiedBase, u16>; 4],
     motif_idxs: u8,
+    /// 0 means no canonical/modified calls have been seen at this position,
+    /// otherwise (index + 1) into `TallyTable::mod_pool`.
+    mods: u32,
 }
 
-impl Tally2 {
+/// Canonical and per-modification-code counts for one primary base at one
+/// (position, strand). A mod code being present with a count of 0 is
+/// meaningful (it produces a bedMethyl row with N_mod = 0).
+#[derive(Debug, Default)]
+struct BaseModCounts {
+    n_canonical: u16,
+    mods: Vec<(ModCodeRepr, u16)>,
+}
+
+impl BaseModCounts {
+    #[inline]
+    fn clear(&mut self) {
+        self.n_canonical = 0;
+        self.mods.clear();
+    }
+
+    #[inline]
+    fn entry(&mut self, mod_code: ModCodeRepr) -> &mut u16 {
+        let idx = match self.mods.iter().position(|(c, _)| *c == mod_code) {
+            Some(idx) => idx,
+            None => {
+                self.mods.push((mod_code, 0u16));
+                self.mods.len() - 1
+            }
+        };
+        &mut self.mods[idx].1
+    }
+}
+
+/// Dense, reusable pileup tally for the generic worker. Positions are
+/// indexed as `relative_position * 2 + strand`, so iterating in index order
+/// yields records sorted by (position, strand). Modification counts are
+/// stored in a side pool that's only touched at positions with calls, and
+/// whose allocations are re-used between intervals.
+#[derive(Debug, Default)]
+pub(super) struct TallyTable {
+    counts: Vec<PositionCounts>,
+    mod_pool: Vec<[BaseModCounts; 4]>,
+    pool_used: usize,
+    touched_lo: usize,
+    touched_hi: usize,
+}
+
+impl TallyTable {
+    pub(super) fn reset(&mut self, width: usize) {
+        if self.touched_lo <= self.touched_hi
+            && self.touched_hi < self.counts.len()
+        {
+            self.counts[self.touched_lo..=self.touched_hi]
+                .fill(PositionCounts::default());
+        }
+        let size = width * 2;
+        if self.counts.len() < size {
+            self.counts.resize(size, PositionCounts::default());
+        }
+        self.pool_used = 0;
+        self.touched_lo = usize::MAX;
+        self.touched_hi = 0;
+    }
+
+    #[inline]
+    fn index(position_strand: PositionStrand) -> usize {
+        let (rpos, strand) = position_strand;
+        let strand_idx = match strand {
+            Strand::Positive => 0usize,
+            Strand::Negative => 1usize,
+        };
+        rpos as usize * 2 + strand_idx
+    }
+
+    #[inline]
     pub(super) fn add_call(
         &mut self,
+        position_strand: PositionStrand,
         call: Call,
         motif_idxs: u8,
         max_coverage: u16,
     ) {
-        self.motif_idxs.bitor_assign(motif_idxs);
-        self.total_cov = self.total_cov.saturating_add(1);
-        if self.total_cov > max_coverage {
+        let idx = Self::index(position_strand);
+        self.touched_lo = self.touched_lo.min(idx);
+        self.touched_hi = self.touched_hi.max(idx);
+        let pc = &mut self.counts[idx];
+        pc.motif_idxs.bitor_assign(motif_idxs);
+        pc.total_cov = pc.total_cov.saturating_add(1);
+        if pc.total_cov > max_coverage {
             return;
         }
         match call {
             Call::Delete => {
-                self.n_delete = self.n_delete.saturating_add(1);
+                pc.n_delete = pc.n_delete.saturating_add(1);
             }
             Call::Filtered(read_base) => {
-                self.n_filtered[read_base as usize] =
-                    self.n_filtered[read_base as usize].saturating_add(1);
+                pc.n_filtered[read_base as usize] =
+                    pc.n_filtered[read_base as usize].saturating_add(1);
             }
             Call::NoCall(read_base) => {
-                self.basecall_counts[read_base as usize] =
-                    self.basecall_counts[read_base as usize].saturating_add(1);
+                pc.basecall_counts[read_base as usize] =
+                    pc.basecall_counts[read_base as usize].saturating_add(1);
             }
             Call::CanonicalCall { primary_base, mod_codes } => {
-                let mod_calls = &mut self.modcall_counts[primary_base as usize];
-                mod_calls
-                    .entry(ModifiedBase::UnModified)
-                    .and_modify(|x| *x = x.saturating_add(1))
-                    .or_insert(1);
-                for mod_code in mod_codes {
-                    mod_calls
-                        .entry(ModifiedBase::Modified(mod_code))
-                        .or_insert(0);
+                let mod_calls = Self::get_mods(
+                    pc,
+                    &mut self.mod_pool,
+                    &mut self.pool_used,
+                    primary_base,
+                );
+                mod_calls.n_canonical = mod_calls.n_canonical.saturating_add(1);
+                for &mod_code in mod_codes {
+                    mod_calls.entry(mod_code);
                 }
             }
             Call::ModifiedCall { primary_base, mod_code, mod_codes } => {
-                let mod_calls = &mut self.modcall_counts[primary_base as usize];
-                mod_calls
-                    .entry(ModifiedBase::Modified(mod_code))
-                    .and_modify(|x| *x = x.saturating_add(1))
-                    .or_insert(1);
-                for mod_code in mod_codes.into_iter().filter(|x| *x != mod_code)
-                {
-                    mod_calls
-                        .entry(ModifiedBase::Modified(mod_code))
-                        .or_insert(0);
+                let mod_calls = Self::get_mods(
+                    pc,
+                    &mut self.mod_pool,
+                    &mut self.pool_used,
+                    primary_base,
+                );
+                let count = mod_calls.entry(mod_code);
+                *count = count.saturating_add(1);
+                for &other in mod_codes.iter().filter(|x| **x != mod_code) {
+                    mod_calls.entry(other);
                 }
             }
         }
     }
 
-    pub(super) fn into_counts(
-        self,
-        start_pos: u32,
-        relative_position: u32,
-        combine_mods: bool,
-        strand: char,
-    ) -> Vec<PileupFeatureCounts2> {
-        self.modcall_counts
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, calls)| {
-                let valid_coverage = calls
-                    .values()
-                    .copied()
-                    .reduce(|a, b| a.saturating_add(b))
-                    .unwrap_or(0u16);
-                if valid_coverage == 0 {
-                    None
-                } else {
-                    Some((DnaBase::try_from(i).unwrap(), calls, valid_coverage))
-                }
-            })
-            .flat_map(|(read_base, calls, filtered_coverage)| {
-                let n_modified_all = calls
-                    .iter()
-                    .filter_map(|(mb, c)| match mb {
-                        ModifiedBase::UnModified => None,
-                        ModifiedBase::Modified(_) => Some(*c),
-                    })
-                    .reduce(|a, b| a.saturating_add(b))
-                    .unwrap_or(0u16);
+    #[inline]
+    fn get_mods<'a>(
+        pc: &mut PositionCounts,
+        mod_pool: &'a mut Vec<[BaseModCounts; 4]>,
+        pool_used: &mut usize,
+        primary_base: DnaBase,
+    ) -> &'a mut BaseModCounts {
+        if pc.mods == 0 {
+            if *pool_used == mod_pool.len() {
+                mod_pool.push(Default::default());
+            } else {
+                mod_pool[*pool_used].iter_mut().for_each(|x| x.clear());
+            }
+            *pool_used += 1;
+            pc.mods = *pool_used as u32;
+        }
+        &mut mod_pool[(pc.mods - 1) as usize][primary_base as usize]
+    }
 
-                let (n_diff, n_nocall) = self
+    /// Emit bedMethyl records for the current interval, in (position,
+    /// strand) order. This must remain equivalent to the per-position
+    /// logic previously implemented by `Tally2::into_counts`.
+    pub(super) fn decode_into(
+        &mut self,
+        start_pos: u32,
+        combine_mods: bool,
+        combine_strands: bool,
+        out: &mut Vec<PileupFeatureCounts2>,
+    ) {
+        if self.touched_lo > self.touched_hi {
+            return;
+        }
+        for idx in self.touched_lo..=self.touched_hi {
+            let pc = self.counts[idx];
+            if pc.mods == 0 {
+                // no canonical or modified calls, no records
+                continue;
+            }
+            let relative_position = (idx / 2) as u32;
+            let strand = if combine_strands {
+                '.'
+            } else if idx % 2 == 0 {
+                Strand::Positive.to_char()
+            } else {
+                Strand::Negative.to_char()
+            };
+            let per_base = &mut self.mod_pool[(pc.mods - 1) as usize];
+            for (i, calls) in per_base.iter_mut().enumerate() {
+                let n_modified_all = calls
+                    .mods
+                    .iter()
+                    .fold(0u16, |acc, (_, c)| acc.saturating_add(*c));
+                let filtered_coverage =
+                    calls.n_canonical.saturating_add(n_modified_all);
+                if filtered_coverage == 0 {
+                    continue;
+                }
+                let read_base = DnaBase::try_from(i).unwrap();
+                let (n_diff, n_nocall) = pc
                     .basecall_counts
                     .iter()
-                    .zip(&self.n_filtered)
+                    .zip(&pc.n_filtered)
                     .enumerate()
                     .fold((0u16, 0u16), |(n_diff, n_nocall), (b, (c, f))| {
-                        if b == (read_base as usize) {
+                        if b == i {
                             (n_diff, n_nocall.saturating_add(*c))
                         } else {
                             (
@@ -2364,49 +2450,44 @@ impl Tally2 {
                             )
                         }
                     });
-
-                let n_filt = self.n_filtered[read_base as usize];
-                let n_canonical =
-                    calls.get(&ModifiedBase::UnModified).copied().unwrap_or(0);
-                assert!(filtered_coverage > 0, "{read_base} {calls:?}");
-                let calls = if combine_mods {
-                    let mut tmp = FxHashMap::default();
-                    tmp.insert(
-                        ModifiedBase::Modified(ModCodeRepr::Code(
-                            read_base.char(),
-                        )),
+                let n_filt = pc.n_filtered[i];
+                let n_canonical = calls.n_canonical;
+                let position = relative_position.saturating_add(start_pos);
+                let make = |mod_code: ModCodeRepr, count: u16| {
+                    PileupFeatureCounts2::new(
+                        position,
+                        strand,
+                        filtered_coverage,
+                        mod_code,
+                        n_canonical,
+                        count,
+                        n_modified_all.saturating_sub(count),
+                        pc.n_delete,
+                        n_filt,
+                        n_diff,
+                        n_nocall,
+                        pc.motif_idxs,
+                    )
+                };
+                if combine_mods {
+                    let row = make(
+                        ModCodeRepr::Code(read_base.char()),
                         n_modified_all,
                     );
-                    tmp
+                    if row.is_valid() {
+                        out.push(row);
+                    }
                 } else {
-                    calls
-                };
-                let counts = calls
-                    .into_iter()
-                    .filter_map(|(mod_base, count)| match mod_base {
-                        ModifiedBase::UnModified => None,
-                        ModifiedBase::Modified(mod_code) => {
-                            Some(PileupFeatureCounts2::new(
-                                relative_position.saturating_add(start_pos),
-                                strand,
-                                filtered_coverage,
-                                mod_code,
-                                n_canonical,
-                                count,
-                                n_modified_all.saturating_sub(count),
-                                self.n_delete,
-                                n_filt,
-                                n_diff,
-                                n_nocall,
-                                self.motif_idxs,
-                            ))
+                    calls.mods.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+                    for &(mod_code, count) in calls.mods.iter() {
+                        let row = make(mod_code, count);
+                        if row.is_valid() {
+                            out.push(row);
                         }
-                    })
-                    .sorted_by(|a, b| a.mod_code.cmp(&b.mod_code))
-                    .collect::<Vec<PileupFeatureCounts2>>();
-                counts
-            })
-            .collect()
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2414,26 +2495,19 @@ type PositionStrand = (u32, Strand);
 
 fn get_base_codes_and_implicits(
     mm_tag_infos: &[MmTagInfo],
-) -> (FxHashMap<DnaBase, Vec<ModCodeRepr>>, FxHashSet<DnaBase>) {
-    mm_tag_infos
-        .iter()
-        .flat_map(|info| {
-            info.fundamental_base.expand_bases().iter().map(|primary_base| {
-                (*primary_base, info.is_implicit(), &info.mod_base_codes)
-            })
-        })
-        .fold(
-            (FxHashMap::default(), FxHashSet::default()),
-            |(mut agg, mut bagg), (base, implicit, codes)| {
-                agg.entry(base)
-                    .or_insert_with(Vec::new)
-                    .extend(codes.iter().copied());
-                if implicit {
-                    bagg.insert(base);
-                }
-                (agg, bagg)
-            },
-        )
+) -> ([Vec<ModCodeRepr>; 4], [bool; 4]) {
+    let mut codes: [Vec<ModCodeRepr>; 4] = Default::default();
+    let mut implicits = [false; 4];
+    for info in mm_tag_infos {
+        for primary_base in info.fundamental_base.expand_bases().iter() {
+            codes[*primary_base as usize]
+                .extend(info.mod_base_codes.iter().copied());
+            if info.is_implicit() {
+                implicits[*primary_base as usize] = true;
+            }
+        }
+    }
+    (codes, implicits)
 }
 
 #[inline]
