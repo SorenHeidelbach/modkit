@@ -14,6 +14,22 @@ use crate::{
     util::qual_to_prob,
 };
 
+/// Same table as rust-htslib's `DECODE_BASE`, see `bam::record::Seq`.
+static DECODE_BASE: &[u8; 16] = b"=ACMGRSVTWYHKDBN";
+
+/// Decode the base at `i` from a BAM 4-bit encoded sequence. Equivalent to
+/// `bam::record::Seq::index` (including bounds checking on the encoded
+/// slice), but can be inlined into hot loops.
+#[inline(always)]
+pub(crate) fn decode_base(encoded: &[u8], i: usize) -> u8 {
+    DECODE_BASE[encoded_nibble(encoded, i)]
+}
+
+#[inline(always)]
+fn encoded_nibble(encoded: &[u8], i: usize) -> usize {
+    ((encoded[i / 2] >> ((!i & 1) << 2)) & 0b1111) as usize
+}
+
 #[derive(Debug, Copy, Clone, new)]
 pub(crate) struct ModState {
     pub mod_position: usize,
@@ -28,7 +44,8 @@ pub(crate) struct ModState {
 #[derive(Debug)]
 pub(crate) struct BaseModsAdapter<'a, const SIZE: usize = 16> {
     mm: &'a [u8],
-    seq: bam::record::Seq<'a>,
+    seq: &'a [u8],
+    seq_len: usize,
     ml: AuxArray<'a, u8>,
     mod_codes: [ModCodeRepr; SIZE],
     canonical_bases: [u8; SIZE],
@@ -42,11 +59,17 @@ pub(crate) struct BaseModsAdapter<'a, const SIZE: usize = 16> {
     num_explicit_positions: [u32; SIZE],
     reverse: bool,
     left_to_right_seq_pos: usize,
+    /// For each 4-bit encoded base, whether `next_modified_position` needs
+    /// to examine a position with this base. Positions whose (strand
+    /// adjusted) base doesn't match any MM-tag canonical base are no-ops and
+    /// can be skipped.
+    scan_mask: [bool; 16],
 }
 
 impl<'a, const SIZE: usize> BaseModsAdapter<'a, SIZE> {
     pub fn new(record: &'a bam::Record) -> anyhow::Result<Self> {
-        let seq = record.seq();
+        let seq = record.seq().encoded;
+        let seq_len = record.seq_len();
         let mm = match record
             .aux("MM".as_bytes())
             .or(record.aux("Mm".as_bytes()))?
@@ -69,19 +92,23 @@ impl<'a, const SIZE: usize> BaseModsAdapter<'a, SIZE> {
         let freq = if reverse {
             // [A, C, G, T]
             //  0  1  2  3
-            (0..record.seq_len()).map(|idx| seq[idx]).fold(
-                [0u32; 4],
-                |mut agg, next| {
-                    match next {
-                        b'A' | b'a' => agg[3] += 1u32,
-                        b'C' | b'c' => agg[2] += 1u32,
-                        b'G' | b'g' => agg[1] += 1u32,
-                        b'T' | b't' => agg[0] += 1u32,
-                        _ => unreachable!(),
-                    }
-                    agg
-                },
-            )
+            // histogram of 4-bit encoded bases, 2 bases per byte
+            let mut hist = [0u32; 16];
+            let full_bytes = seq_len / 2;
+            for &b in &seq[..full_bytes] {
+                hist[(b >> 4) as usize] += 1;
+                hist[(b & 0b1111) as usize] += 1;
+            }
+            if seq_len % 2 == 1 {
+                hist[encoded_nibble(seq, seq_len - 1)] += 1;
+            }
+            // encoded A=1, C=2, G=4, T=8, any other base is not allowed
+            if hist.iter().enumerate().any(|(nibble, &count)| {
+                count > 0 && !matches!(nibble, 1 | 2 | 4 | 8)
+            }) {
+                unreachable!()
+            }
+            [hist[8], hist[4], hist[2], hist[1]]
         } else {
             [0u32; 4]
         };
@@ -187,10 +214,26 @@ impl<'a, const SIZE: usize> BaseModsAdapter<'a, SIZE> {
             i += record_end + 1;
         }
 
+        let mut scan_mask = [false; 16];
+        for (nibble, &decoded) in DECODE_BASE.iter().enumerate() {
+            scan_mask[nibble] = if reverse {
+                match decoded {
+                    // base_complement panics on anything else, keep that
+                    // behavior by sending these positions down the slow path
+                    b'A' | b'C' | b'G' | b'T' => canonical_bases[..n_codes]
+                        .contains(&base_complement(decoded)),
+                    _ => true,
+                }
+            } else {
+                canonical_bases[..n_codes].contains(&decoded)
+            };
+        }
+
         Ok(Self {
             mm,
             ml,
             seq,
+            seq_len,
             mod_codes,
             canonical_bases,
             n_codes,
@@ -203,6 +246,7 @@ impl<'a, const SIZE: usize> BaseModsAdapter<'a, SIZE> {
             num_explicit_positions,
             reverse,
             left_to_right_seq_pos: 0,
+            scan_mask,
         })
     }
 
@@ -222,11 +266,16 @@ impl<'a, const SIZE: usize> BaseModsAdapter<'a, SIZE> {
         let mut done = false;
         let mut inferred = true;
 
-        while !done && pos < self.seq.len() {
+        while !done && pos < self.seq_len {
+            // fast-forward over positions that cannot match any MM code
+            if !self.scan_mask[encoded_nibble(self.seq, pos)] {
+                pos += 1;
+                continue;
+            }
             let base = if self.reverse {
-                base_complement(self.seq[pos])
+                base_complement(decode_base(self.seq, pos))
             } else {
-                self.seq[pos]
+                decode_base(self.seq, pos)
             };
             for i in 0..self.n_codes {
                 match &mut self.mm_next[i] {
@@ -266,9 +315,9 @@ impl<'a, const SIZE: usize> BaseModsAdapter<'a, SIZE> {
             let mut mod_qual = 0u8;
             let mut total_mod_qual = 0u8;
             let base = if self.reverse {
-                base_complement(self.seq[mod_pos])
+                base_complement(decode_base(self.seq, mod_pos))
             } else {
-                self.seq[mod_pos]
+                decode_base(self.seq, mod_pos)
             };
             let mut mod_code = ModCodeRepr::Code(base as char);
             for i in 0..self.n_codes {
@@ -463,6 +512,7 @@ fn parse_int<const DELIM: u8, const END: u8>(bs: &[u8]) -> (u32, usize) {
     (val, idx)
 }
 
+#[inline(always)]
 fn base_complement(base: u8) -> u8 {
     match base {
         b'A' => b'T',

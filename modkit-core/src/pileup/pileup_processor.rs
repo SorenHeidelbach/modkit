@@ -21,7 +21,7 @@ use crate::{
     },
     motifs::motif_bed::MotifInfo,
     pileup::{
-        base_mods_adapter::{BaseModsAdapter, ModState},
+        base_mods_adapter::{decode_base, BaseModsAdapter, ModState},
         ModBasePileup2, PileupFeatureCounts2, PileupNumericOptions,
     },
     threshold_mod_caller::MultipleThresholdModCaller,
@@ -198,6 +198,7 @@ impl<
             }
 
             let reverse = record.is_reverse();
+            let seq_enc = record.seq().encoded;
             let read_length = record.seq_len();
             let Ok(mut modbase_iter) = BaseModsAdapter::<16>::new(&record)
             else {
@@ -318,7 +319,7 @@ impl<
                     // call
                     (Some(q), Some(mp)) if q < mp.mod_position => {
                         let base = {
-                            let Ok(tmp) = DnaBase::try_from(record.seq()[q])
+                            let Ok(tmp) = DnaBase::try_from(decode_base(seq_enc, q))
                             else {
                                 erred_records = erred_records.saturating_add(1);
                                 continue 'records;
@@ -362,7 +363,7 @@ impl<
                                             assert!(pos > q);
                                             let base = {
                                                 let tmp = DnaBase::try_from(
-                                                    record.seq()[q],
+                                                    decode_base(seq_enc, q),
                                                 )
                                                 .unwrap();
                                                 if record.is_reverse() {
@@ -388,7 +389,7 @@ impl<
                                 Ok(None) => {
                                     let base = {
                                         let tmp =
-                                            DnaBase::try_from(record.seq()[q])
+                                            DnaBase::try_from(decode_base(seq_enc, q))
                                                 .unwrap();
                                         if record.is_reverse() {
                                             tmp.complement()
@@ -412,7 +413,7 @@ impl<
                     (Some(q), None) => {
                         let base = {
                             let tmp =
-                                DnaBase::try_from(record.seq()[q]).unwrap();
+                                DnaBase::try_from(decode_base(seq_enc, q)).unwrap();
                             if record.is_reverse() {
                                 tmp.complement()
                             } else {
@@ -635,6 +636,7 @@ impl PileupWorker for GenericPileupWorker {
         let mut mod_strand = Option::<Strand>::None;
         'records: for record in records {
             let reverse = record.is_reverse();
+            let seq_enc = record.seq().encoded;
             let record_strand = if record.is_reverse() {
                 Strand::Negative
             } else {
@@ -760,7 +762,7 @@ impl PileupWorker for GenericPileupWorker {
                     }
                     (Some(q), Some(mp)) if q < mp => {
                         let base = {
-                            let Ok(tmp) = DnaBase::try_from(record.seq()[q])
+                            let Ok(tmp) = DnaBase::try_from(decode_base(seq_enc, q))
                             else {
                                 erred_records = erred_records.saturating_add(1);
                                 continue 'records;
@@ -863,7 +865,7 @@ impl PileupWorker for GenericPileupWorker {
                                     assert!(pos > q);
                                     let base = {
                                         let tmp =
-                                            DnaBase::try_from(record.seq()[q])
+                                            DnaBase::try_from(decode_base(seq_enc, q))
                                                 .unwrap();
                                         if record.is_reverse() {
                                             tmp.complement()
@@ -911,7 +913,7 @@ impl PileupWorker for GenericPileupWorker {
                     (Some(q), None) => {
                         let base = {
                             let tmp =
-                                DnaBase::try_from(record.seq()[q]).unwrap();
+                                DnaBase::try_from(decode_base(seq_enc, q)).unwrap();
                             if record.is_reverse() {
                                 tmp.complement()
                             } else {
