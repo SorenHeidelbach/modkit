@@ -18,6 +18,7 @@
 //! * reads that do not align are kept (flagged unmapped) unless requested
 //!   otherwise.
 
+use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,7 +29,6 @@ use clap::{Args, ValueEnum};
 use crossbeam_channel::bounded;
 use log::{debug, info, warn};
 use minimap2::{Aligner, Built, Mapping, Preset, Strand};
-use rayon::prelude::*;
 use rust_htslib::bam::record::{Aux, Cigar, CigarString};
 use rust_htslib::bam::{self, HeaderView, Read};
 
@@ -125,9 +125,9 @@ pub struct AlignModBam {
     #[clap(help_heading = "Compute Options")]
     #[arg(short, long, default_value_t = 4)]
     threads: usize,
-    /// Number of reads to align per batch.
+    /// Number of reads handed to an alignment thread at a time.
     #[clap(help_heading = "Compute Options")]
-    #[arg(long, default_value_t = 2_000, hide_short_help = true)]
+    #[arg(long, default_value_t = 32, hide_short_help = true)]
     batch_size: usize,
     /// Output secondary alignments. Secondary records carry the full read
     /// sequence so that their MM/ML tags remain valid.
@@ -144,8 +144,13 @@ pub struct AlignModBam {
     md: bool,
     /// Output SAM format instead of BAM.
     #[clap(help_heading = "Output Options")]
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "uncompressed")]
     output_sam: bool,
+    /// Write uncompressed BAM. Saves CPU time when the output is piped into
+    /// another tool, e.g. `samtools sort`.
+    #[clap(help_heading = "Output Options")]
+    #[arg(short = 'u', long, default_value_t = false)]
+    uncompressed: bool,
     /// Output debug logs to file at this path.
     #[clap(help_heading = "Logging Options")]
     #[arg(long, alias = "log")]
@@ -174,10 +179,6 @@ impl AlignModBam {
             bail!("batch-size must be at least 1");
         }
 
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(self.threads)
-            .build()?;
-
         info!(
             "loading/building minimap2 index from {:?} with preset {:?}",
             self.reference, self.preset
@@ -195,30 +196,58 @@ impl AlignModBam {
         let mut writer =
             get_bam_writer(&self.out_bam, &header, self.output_sam)?;
         writer.set_threads(io_threads)?;
+        if self.uncompressed {
+            writer
+                .set_compression_level(bam::CompressionLevel::Uncompressed)?;
+        }
 
         let counts = Counts::default();
         let ticker = get_ticker();
         ticker.set_message("reads aligned");
 
-        let (batch_snd, batch_rcv) = bounded::<Vec<SafeRecord>>(2);
-        let (out_snd, out_rcv) = bounded::<Vec<SafeRecord>>(2);
         let settings = MapSettings {
             secondary: self.secondary,
             unmapped: !self.no_unmapped,
             md: self.md,
         };
 
+        // Pipeline: reader -> workers -> (re-ordering) writer. Work is sent
+        // in small chunks so that a few long reads don't leave the other
+        // workers idle. The number of chunks in flight (being aligned or
+        // waiting to be written in order) is limited by a pool of tokens,
+        // which bounds memory use.
+        let max_in_flight = self.threads * 8;
+        let (token_snd, token_rcv) = bounded::<()>(max_in_flight);
+        for _ in 0..max_in_flight {
+            token_snd.send(()).expect("token channel should be open");
+        }
+        let (work_snd, work_rcv) =
+            bounded::<(usize, Vec<SafeRecord>)>(max_in_flight);
+        let (done_snd, done_rcv) =
+            bounded::<(usize, Vec<SafeRecord>)>(max_in_flight);
+
         std::thread::scope(|scope| -> anyhow::Result<()> {
             let counts = &counts;
-            let batch_size = self.batch_size;
+            let chunk_size = self.batch_size;
             let reader_handle = scope.spawn(move || -> anyhow::Result<()> {
-                let mut batch = Vec::with_capacity(batch_size);
+                let mut chunk = Vec::with_capacity(chunk_size);
+                let mut chunk_idx = 0usize;
+                let mut send = |chunk: Vec<SafeRecord>| -> bool {
+                    // a closed channel means downstream stopped due to an
+                    // error, that error is reported by the writer.
+                    if token_rcv.recv().is_err() {
+                        return false;
+                    }
+                    let ok = work_snd.send((chunk_idx, chunk)).is_ok();
+                    chunk_idx += 1;
+                    ok
+                };
                 let mut record = bam::Record::new();
                 while let Some(res) = reader.read(&mut record) {
                     res.context("failed to read input record")?;
                     counts.reads_in.fetch_add(1, Ordering::Relaxed);
                     match make_template(&record) {
-                        Ok(template) => batch.push(SafeRecord::from(template)),
+                        Ok(template) => chunk.push(SafeRecord::from(template)),
                         Err(skip) => {
                             let counter = match skip {
                                 Skip::SecondaryOrSupplementary => {
@@ -232,78 +261,105 @@ impl AlignModBam {
                             counter.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    if batch.len() >= batch_size {
+                    if chunk.len() >= chunk_size {
                         let full = std::mem::replace(
-                            &mut batch,
-                            Vec::with_capacity(batch_size),
+                            &mut chunk,
+                            Vec::with_capacity(chunk_size),
                         );
-                        if batch_snd.send(full).is_err() {
-                            // downstream hung up (error), stop reading
+                        if !send(full) {
                             return Ok(());
                         }
                     }
                 }
-                if !batch.is_empty() {
-                    let _ = batch_snd.send(batch);
-                }
-                Ok(())
-            });
-
-            let ticker = &ticker;
-            let writer_handle = scope.spawn(move || -> anyhow::Result<()> {
-                for batch in out_rcv {
-                    for safe_record in batch {
-                        let record: bam::Record = safe_record.into();
-                        writer
-                            .write(&record)
-                            .context("failed to write output record")?;
-                        counts.records_out.fetch_add(1, Ordering::Relaxed);
-                    }
+                if !chunk.is_empty() {
+                    send(chunk);
                 }
                 Ok(())
             });
 
             let aligner = &aligner;
             let settings = &settings;
-            let mut align_result = Ok(());
-            for batch in batch_rcv {
-                let n_reads = batch.len() as u64;
-                let aligned = pool.install(|| {
-                    batch
-                        .into_par_iter()
-                        .map(|template| {
-                            align_read(template.into(), aligner, settings)
-                        })
-                        .collect::<Vec<_>>()
-                });
-                let mut out = Vec::with_capacity(aligned.len());
-                for res in aligned {
-                    match res {
-                        Ok(AlignOutcome::Mapped(records)) => {
-                            counts.mapped.fetch_add(1, Ordering::Relaxed);
-                            out.extend(
-                                records.into_iter().map(SafeRecord::from),
-                            );
-                        }
-                        Ok(AlignOutcome::Unmapped(record)) => {
-                            counts.unmapped.fetch_add(1, Ordering::Relaxed);
-                            if let Some(record) = record {
-                                out.push(SafeRecord::from(record));
+            let worker_handles = (0..self.threads)
+                .map(|_| {
+                    let work_rcv = work_rcv.clone();
+                    let done_snd = done_snd.clone();
+                    scope.spawn(move || {
+                        for (chunk_idx, chunk) in work_rcv {
+                            let mut out = Vec::with_capacity(chunk.len() + 8);
+                            for template in chunk {
+                                match align_read(
+                                    template.into(),
+                                    aligner,
+                                    settings,
+                                ) {
+                                    Ok(AlignOutcome::Mapped(records)) => {
+                                        counts
+                                            .mapped
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        out.extend(
+                                            records
+                                                .into_iter()
+                                                .map(SafeRecord::from),
+                                        );
+                                    }
+                                    Ok(AlignOutcome::Unmapped(record)) => {
+                                        counts
+                                            .unmapped
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        if let Some(record) = record {
+                                            out.push(SafeRecord::from(record));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!("failed to align read, {e}");
+                                        counts
+                                            .failed
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            if done_snd.send((chunk_idx, out)).is_err() {
+                                break;
                             }
                         }
-                        Err(e) => {
-                            debug!("failed to align read, {e}");
-                            counts.failed.fetch_add(1, Ordering::Relaxed);
+                    })
+                })
+                .collect::<Vec<_>>();
+            drop(work_rcv);
+            drop(done_snd);
+
+            let ticker = &ticker;
+            let writer_handle = scope.spawn(move || -> anyhow::Result<()> {
+                let mut pending = BTreeMap::<usize, Vec<SafeRecord>>::new();
+                let mut next_idx = 0usize;
+                for (chunk_idx, records) in done_rcv {
+                    pending.insert(chunk_idx, records);
+                    while let Some(records) = pending.remove(&next_idx) {
+                        let mut n_reads = 0u64;
+                        let mut prev_name: Option<Vec<u8>> = None;
+                        for safe_record in records {
+                            let record: bam::Record = safe_record.into();
+                            if prev_name.as_deref() != Some(record.qname()) {
+                                n_reads += 1;
+                                prev_name = Some(record.qname().to_vec());
+                            }
+                            writer
+                                .write(&record)
+                                .context("failed to write output record")?;
+                            counts.records_out.fetch_add(1, Ordering::Relaxed);
                         }
+                        ticker.inc(n_reads);
+                        next_idx += 1;
+                        // hand back the token, the reader may have exited
+                        let _ = token_snd.send(());
                     }
                 }
-                ticker.inc(n_reads);
-                if out_snd.send(out).is_err() {
-                    align_result = Err(anyhow!("output writer stopped"));
-                    break;
-                }
+                Ok(())
+            });
+
+            for handle in worker_handles {
+                handle.join().map_err(|_| anyhow!("worker thread panicked"))?;
             }
-            drop(out_snd);
             let writer_result = writer_handle
                 .join()
                 .map_err(|_| anyhow!("writer thread panicked"))?;
@@ -312,8 +368,7 @@ impl AlignModBam {
                 .map_err(|_| anyhow!("reader thread panicked"))?;
             // report the most specific error first
             writer_result?;
-            reader_result?;
-            align_result
+            reader_result
         })?;
         ticker.finish_and_clear();
 

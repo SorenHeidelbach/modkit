@@ -12,6 +12,13 @@ modkit pileup aligned.sorted.bam pileup.bed
 The reference can be a FASTA (optionally gzipped) or a pre-built minimap2 index (`.mmi`).
 Use `-x/--preset` to pick the minimap2 preset (default `map-ont`, use e.g. `map-hifi` for PacBio HiFi reads).
 The output is not sorted.
+To skip compressing the intermediate file, write uncompressed BAM with `-u` and pipe it into `samtools sort`:
+
+```bash
+modkit modbam align -u -t 8 --ref reference.mmi calls.bam - | samtools sort -@ 4 -o aligned.sorted.bam
+```
+
+For large references, build the index once with `minimap2 -x map-ont -d reference.mmi reference.fa` (use the same preset) and pass the `.mmi`, otherwise the index is rebuilt on every run.
 
 ## Compared to `samtools fastq -T MM,ML | minimap2 -y`
 
