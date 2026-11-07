@@ -204,6 +204,43 @@ CG->CH substitution such that no modification call was produced by the basecalle
 | 17     | N<sub>diff</sub>             | see definitions above                                                           | int   |
 | 18     | N<sub>nocall</sub>           | see definitions above                                                           | int   |
 
+## Base modification probability statistics with `--prob-stats`
+
+The counts above are made after each read's base modification probabilities have been converted into a call using
+the filter threshold. With `--prob-stats`, `modkit pileup` also summarizes the probabilities themselves and appends
+seven columns to each record. The first 18 columns are unchanged, and the output without `--prob-stats` is not
+affected.
+
+```bash
+modkit pileup path/to/reads.bam output/path/pileup.bed \
+  --ref path/to/reference.fasta \
+  --cpg \
+  --modified-bases 5mC 5hmC \
+  --prob-stats
+```
+
+For each record, every read with a canonical, modified, or filtered (failed threshold) call at the position
+contributes one probability: the probability of the record's modification code, as reported in the `ML` tag (calls
+inferred from implicit, `.` mode, positions contribute 0). With `--combine-mods`, the per-read value is the summed
+probability of all modifications of the primary base. Reads counted in N<sub>diff</sub>, N<sub>delete</sub>, or
+N<sub>nocall</sub> do not contribute, so when every read reports the record's modification code,
+`n_prob` = N<sub>valid_cov</sub> + N<sub>fail</sub>. Because filtered calls are included, these statistics do not
+depend on the filter threshold.
+
+| column | name              | description                                                                                                        | type  |
+|--------|-------------------|--------------------------------------------------------------------------------------------------------------------|-------|
+| 19     | n_prob            | number of reads contributing a probability                                                                         | int   |
+| 20     | mean_prob         | mean probability of the modification                                                                               | float |
+| 21     | sd_prob           | (population) standard deviation of the probability                                                                 | float |
+| 22     | q25_prob          | 25th percentile of the probability                                                                                 | float |
+| 23     | median_prob       | median probability                                                                                                 | float |
+| 24     | q75_prob          | 75th percentile of the probability                                                                                 | float |
+| 25     | mean_confidence   | mean, over the same reads, of the probability of the most likely class (canonical or any modification), where P(canonical) = 1 - sum(P(mod)) | float |
+
+Percentiles use linear interpolation between order statistics (the default method in numpy and R). Values are written
+with 4 decimal places; when `n_prob` is 0 the statistics are written as `.`. `--prob-stats` cannot be combined with
+`--phased` or `--bedrmod`.
+
 ## bedRMod output
 
 > [!IMPORTANT]

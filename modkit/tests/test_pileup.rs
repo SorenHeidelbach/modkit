@@ -1016,3 +1016,179 @@ fn test_pilep_phased() {
         normal_output_pileup.to_str().unwrap(),
     );
 }
+
+fn read_lines(fp: &PathBuf) -> Vec<String> {
+    BufReader::new(File::open(fp).unwrap())
+        .lines()
+        .map(|l| l.unwrap())
+        .collect()
+}
+
+/// Runs pileup with and without --prob-stats and checks that the standard
+/// columns are unchanged, the extra columns are well formed, and that every
+/// read counted at a position (valid coverage + failed calls) contributed a
+/// probability.
+fn check_prob_stats_against_counts(name: &str, args: &[&str]) -> Vec<String> {
+    let without = std::env::temp_dir().join(format!("{name}_without.bed"));
+    let with = std::env::temp_dir().join(format!("{name}_with.bed"));
+    let mut a = vec!["pileup"];
+    a.extend_from_slice(args);
+    let mut a_without = a.clone();
+    a_without.push(without.to_str().unwrap());
+    run_modkit(&a_without).unwrap();
+    let mut a_with = a.clone();
+    a_with.extend_from_slice(&["--prob-stats", with.to_str().unwrap()]);
+    run_modkit(&a_with).unwrap();
+
+    let without = read_lines(&without);
+    let with = read_lines(&with);
+    assert!(!with.is_empty());
+    assert_eq!(without.len(), with.len());
+    for (a, b) in without.iter().zip(with.iter()) {
+        let fa = a.split('\t').collect::<Vec<_>>();
+        let fb = b.split('\t').collect::<Vec<_>>();
+        assert_eq!(fa.len(), 18);
+        assert_eq!(fb.len(), 25, "{b}");
+        assert_eq!(fa[..], fb[..18], "standard columns changed");
+        let valid = fa[9].parse::<u32>().unwrap();
+        let fail = fa[15].parse::<u32>().unwrap();
+        let n = fb[18].parse::<u32>().unwrap();
+        assert_eq!(n, valid + fail, "{b}");
+        let stats = fb[19..]
+            .iter()
+            .map(|x| x.parse::<f32>().unwrap())
+            .collect::<Vec<f32>>();
+        let (mean, sd, q25, median, q75, conf) =
+            (stats[0], stats[1], stats[2], stats[3], stats[4], stats[5]);
+        for x in [mean, q25, median, q75] {
+            assert!((0f32..=1f32).contains(&x), "{b}");
+        }
+        assert!(sd >= 0f32, "{b}");
+        assert!(q25 <= median && median <= q75, "{b}");
+        // the most likely class has probability of at least 1/N classes
+        assert!(conf >= 0.33 && conf <= 1f32, "{b}");
+    }
+    with
+}
+
+#[test]
+fn test_pileup_prob_stats() {
+    // generic worker, small interval to check chunking
+    let rows = check_prob_stats_against_counts(
+        "test_pileup_prob_stats_generic",
+        &[
+            "-i",
+            "25",
+            "--no-filtering",
+            "../tests/resources/bc_anchored_10_reads.sorted.bam",
+        ],
+    );
+
+    // independently compute n and mean probability per position, strand,
+    // and modification code from the read-level probabilities
+    let extract_fp =
+        std::env::temp_dir().join("test_pileup_prob_stats_extract.tsv");
+    run_modkit(&[
+        "extract",
+        "full",
+        "../tests/resources/bc_anchored_10_reads.sorted.bam",
+        extract_fp.to_str().unwrap(),
+        "--force",
+    ])
+    .unwrap();
+    let extract = read_lines(&extract_fp);
+    let header = extract[0].split('\t').collect::<Vec<_>>();
+    let col = |name: &str| header.iter().position(|x| *x == name).unwrap();
+    let (chrom, pos, strand, code, prob) = (
+        col("chrom"),
+        col("ref_position"),
+        col("ref_mod_strand"),
+        col("mod_code"),
+        col("mod_qual"),
+    );
+    let mut expected: HashMap<(String, i64, String, String), Vec<f64>> =
+        HashMap::new();
+    for line in extract.iter().skip(1) {
+        let f = line.split('\t').collect::<Vec<_>>();
+        let p = f[pos].parse::<i64>().unwrap();
+        if p < 0 {
+            continue;
+        }
+        expected
+            .entry((
+                f[chrom].to_string(),
+                p,
+                f[strand].to_string(),
+                f[code].to_string(),
+            ))
+            .or_default()
+            .push(f[prob].parse::<f64>().unwrap());
+    }
+    for row in rows {
+        let f = row.split('\t').collect::<Vec<_>>();
+        let key = (
+            f[0].to_string(),
+            f[1].parse::<i64>().unwrap(),
+            f[5].to_string(),
+            f[3].to_string(),
+        );
+        let probs = expected.get(&key).expect("missing position in extract");
+        assert_eq!(f[18].parse::<usize>().unwrap(), probs.len(), "{row}");
+        let mean = probs.iter().sum::<f64>() / probs.len() as f64;
+        let observed = f[19].parse::<f64>().unwrap();
+        assert!((observed - mean).abs() < 1e-4, "{row} expected {mean}");
+    }
+
+    // optimized CpG workers, combining strands
+    check_prob_stats_against_counts(
+        "test_pileup_prob_stats_cpg",
+        &[
+            "--no-filtering",
+            "--ref",
+            "../tests/resources/CGI_ladder_3.6kb_ref.fa",
+            "--cpg",
+            "--modified-bases",
+            "5mC",
+            "5hmC",
+            "--combine-strands",
+            "../tests/resources/bc_anchored_10_reads.sorted.bam",
+        ],
+    );
+    // generic workers, combined modification codes
+    check_prob_stats_against_counts(
+        "test_pileup_prob_stats_combine_mods",
+        &[
+            "--combine-mods",
+            "--filter-threshold",
+            "0.7",
+            "../tests/resources/bc_anchored_10_reads.sorted.bam",
+        ],
+    );
+
+    // header has the extra fields
+    let out = std::env::temp_dir().join("test_pileup_prob_stats_header.bed");
+    run_modkit(&[
+        "pileup",
+        "--no-filtering",
+        "--header",
+        "--prob-stats",
+        "../tests/resources/bc_anchored_10_reads.sorted.bam",
+        out.to_str().unwrap(),
+    ])
+    .unwrap();
+    let lines = read_lines(&out);
+    let header = lines[0].split('\t').collect::<Vec<_>>();
+    assert_eq!(header.len(), 25);
+    assert_eq!(
+        header[18..],
+        [
+            "n_prob",
+            "mean_prob",
+            "sd_prob",
+            "q25_prob",
+            "median_prob",
+            "q75_prob",
+            "mean_confidence"
+        ]
+    );
+}

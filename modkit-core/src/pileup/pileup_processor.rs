@@ -22,6 +22,7 @@ use crate::{
     motifs::motif_bed::MotifInfo,
     pileup::{
         base_mods_adapter::{decode_base, BaseModsAdapter, ModState},
+        prob_stats::ProbAccumulator,
         ModBasePileup2, PileupFeatureCounts2, PileupNumericOptions,
     },
     threshold_mod_caller::MultipleThresholdModCaller,
@@ -66,6 +67,9 @@ pub(super) struct DnaPileupWorker<
     edge_filter_start: usize,
     edge_filter_end: usize,
     matrix: M,
+    motif_offset: u32,
+    prob_stats: bool,
+    prob_acc: ProbAccumulator,
     t: PhantomData<T>,
 }
 
@@ -76,6 +80,24 @@ impl<
         const CHECK_DEPTH: bool,
     > DnaPileupWorker<T, M, STRANDS, CHECK_DEPTH>
 {
+    /// Record probabilities for `--prob-stats` using the same position and
+    /// strand mapping as the counts matrices: with strands combined
+    /// (STRANDS == 1) negative strand calls are shifted by the motif
+    /// offset onto the positive strand position.
+    #[inline]
+    fn add_probs(
+        prob_acc: &mut ProbAccumulator,
+        motif_offset: u32,
+        rpos: u32,
+        reverse: bool,
+        primary_base: DnaBase,
+        mod_probs: &[(ModCodeRepr, f32)],
+    ) {
+        let rpos =
+            if reverse { rpos.saturating_sub(motif_offset) } else { rpos };
+        prob_acc.add(rpos, STRANDS > 1 && reverse, primary_base, mod_probs);
+    }
+
     pub(crate) fn new(
         bam_fp: &PathBuf,
         reference_fp: &PathBuf,
@@ -89,6 +111,7 @@ impl<
         edge_filter: Option<&EdgeFilter>,
         motif_offset: u32,
         max_depth: u16,
+        prob_stats: bool,
     ) -> anyhow::Result<Self> {
         let combine_mods = match dna_mod_option {
             DnaModOption::Combine => true,
@@ -126,6 +149,9 @@ impl<
             edge_filter_end,
             motif_bases,
             matrix,
+            motif_offset,
+            prob_stats,
+            prob_acc: ProbAccumulator::default(),
             t: PhantomData::<T>,
         })
     }
@@ -153,6 +179,9 @@ impl<
             .ok_or_else(|| anyhow!("interval end before start"))?
             as usize;
         self.matrix.reset(width, self.phased);
+        if self.prob_stats {
+            self.prob_acc.reset(width);
+        }
 
         let chrom_name =
             String::from_utf8_lossy(self.reader.header().tid2name(chrom_tid))
@@ -205,6 +234,7 @@ impl<
                 erred_records = erred_records.saturating_add(1);
                 continue 'records;
             };
+            modbase_iter.set_record_probs(self.prob_stats);
 
             let Ok(mut mod_state) = modbase_iter.next_modified_position(
                 self.filter_thresholds,
@@ -293,6 +323,12 @@ impl<
                 match (qpos, mod_state) {
                     // at this aligned position we have a base modification call
                     (Some(q), Some(mp)) if q == mp.mod_position => {
+                        let count_probs = self.prob_stats
+                            && mp.primary_base == ref_base
+                            && !(CHECK_DEPTH
+                                && self
+                                    .matrix
+                                    .reached_max_depth(rpos, reverse, hp));
                         self.matrix.incr_call(
                             mp,
                             rpos,
@@ -301,6 +337,16 @@ impl<
                             hp,
                             self.combine_mods,
                         );
+                        if count_probs {
+                            Self::add_probs(
+                                &mut self.prob_acc,
+                                self.motif_offset,
+                                rpos,
+                                reverse,
+                                mp.primary_base,
+                                modbase_iter.last_mod_probs(),
+                            );
+                        }
 
                         if let Ok(next_mod_state) = modbase_iter
                             .next_modified_position(
@@ -319,7 +365,8 @@ impl<
                     // call
                     (Some(q), Some(mp)) if q < mp.mod_position => {
                         let base = {
-                            let Ok(tmp) = DnaBase::try_from(decode_base(seq_enc, q))
+                            let Ok(tmp) =
+                                DnaBase::try_from(decode_base(seq_enc, q))
                             else {
                                 erred_records = erred_records.saturating_add(1);
                                 continue 'records;
@@ -349,6 +396,14 @@ impl<
                                         continue 'overran;
                                     } else {
                                         if q == pos {
+                                            let count_probs = self.prob_stats
+                                                && ms.primary_base == ref_base
+                                                && !(CHECK_DEPTH
+                                                    && self
+                                                        .matrix
+                                                        .reached_max_depth(
+                                                            rpos, reverse, hp,
+                                                        ));
                                             self.matrix.incr_call(
                                                 ms,
                                                 rpos,
@@ -357,6 +412,17 @@ impl<
                                                 hp,
                                                 self.combine_mods,
                                             );
+                                            if count_probs {
+                                                Self::add_probs(
+                                                    &mut self.prob_acc,
+                                                    self.motif_offset,
+                                                    rpos,
+                                                    reverse,
+                                                    ms.primary_base,
+                                                    modbase_iter
+                                                        .last_mod_probs(),
+                                                );
+                                            }
                                             mod_state = Some(ms);
                                             break 'overran;
                                         } else {
@@ -388,9 +454,10 @@ impl<
                                 }
                                 Ok(None) => {
                                     let base = {
-                                        let tmp =
-                                            DnaBase::try_from(decode_base(seq_enc, q))
-                                                .unwrap();
+                                        let tmp = DnaBase::try_from(
+                                            decode_base(seq_enc, q),
+                                        )
+                                        .unwrap();
                                         if record.is_reverse() {
                                             tmp.complement()
                                         } else {
@@ -413,7 +480,8 @@ impl<
                     (Some(q), None) => {
                         let base = {
                             let tmp =
-                                DnaBase::try_from(decode_base(seq_enc, q)).unwrap();
+                                DnaBase::try_from(decode_base(seq_enc, q))
+                                    .unwrap();
                             if record.is_reverse() {
                                 tmp.complement()
                             } else {
@@ -459,6 +527,8 @@ impl<
             pileup_space.stride = self.matrix.stride(self.dna_mod_option);
             pileup_space.position_feature_counts = combined_counts;
             pileup_space.phased_feature_counts = [hp1, hp2];
+            // --prob-stats is not supported with phased output
+            pileup_space.prob_stats.clear();
             pileup_space.failed_records = erred_records;
             Ok(pileup_space)
         } else {
@@ -469,6 +539,16 @@ impl<
                 .into_iter()
                 .filter(|x| x.is_valid())
                 .collect();
+            if self.prob_stats {
+                self.prob_acc.stats_for_rows(
+                    start_pos,
+                    &pileup_space.position_feature_counts,
+                    self.combine_mods,
+                    &mut pileup_space.prob_stats,
+                );
+            } else {
+                pileup_space.prob_stats.clear();
+            }
             pileup_space.failed_records = erred_records;
             Ok(pileup_space)
         }
@@ -490,6 +570,8 @@ pub struct GenericPileupWorker {
     combine_strands: bool,
     max_depth: u16,
     tally_table: TallyTable,
+    prob_stats: bool,
+    prob_acc: ProbAccumulator,
 }
 
 impl GenericPileupWorker {
@@ -503,6 +585,7 @@ impl GenericPileupWorker {
         pileup_numeric_options: PileupNumericOptions,
         combine_strands: bool,
         max_depth: u16,
+        prob_stats: bool,
     ) -> anyhow::Result<Self> {
         let mut reader = bam::IndexedReader::from_path(in_bam_fp)?;
         if reader_is_cram(&reader) {
@@ -546,6 +629,8 @@ impl GenericPileupWorker {
             combine_strands,
             max_depth,
             tally_table: TallyTable::default(),
+            prob_stats,
+            prob_acc: ProbAccumulator::default(),
         })
     }
 }
@@ -586,54 +671,81 @@ impl PileupWorker for GenericPileupWorker {
         // replaces a per-interval hash map keyed on position/strand
         let tally_table = &mut self.tally_table;
         tally_table.reset(width);
-        let mut add_to_tally = |position_strand: PositionStrand,
-                                call: Call,
-                                motif_info: Option<&MotifInfo>,
-                                motif_idxs: u8| {
-            let call = match motif_info.map(|x| x.primary_base) {
-                Some(x) if call.matches_dna_base(&x) => call,
-                Some(_x) => match call {
-                    Call::Delete => call,
-                    Call::Filtered(primary_base)
-                    | Call::NoCall(primary_base)
-                    | Call::CanonicalCall { primary_base, .. }
-                    | Call::ModifiedCall { primary_base, .. } => {
-                        Call::NoCall(primary_base)
+        let prob_stats = self.prob_stats;
+        let prob_acc = &mut self.prob_acc;
+        if prob_stats {
+            prob_acc.reset(width);
+        }
+        let mut add_to_tally =
+            |position_strand: PositionStrand,
+             call: Call,
+             motif_info: Option<&MotifInfo>,
+             motif_idxs: u8,
+             mod_probs: &[(ModCodeRepr, f32)]| {
+                let call = match motif_info.map(|x| x.primary_base) {
+                    Some(x) if call.matches_dna_base(&x) => call,
+                    Some(_x) => match call {
+                        Call::Delete => call,
+                        Call::Filtered(primary_base)
+                        | Call::NoCall(primary_base)
+                        | Call::CanonicalCall { primary_base, .. }
+                        | Call::ModifiedCall { primary_base, .. } => {
+                            Call::NoCall(primary_base)
+                        }
+                    },
+                    None => call,
+                };
+                let position_strand = match motif_info {
+                    Some(motif_info) if self.combine_strands => {
+                        let (rpos, strand) = position_strand;
+                        if strand == Strand::Negative {
+                            (
+                                rpos.saturating_sub(
+                                    (motif_info.reverse_offset
+                                        - motif_info.forward_offset)
+                                        as u32,
+                                ),
+                                Strand::Positive,
+                            )
+                        } else {
+                            position_strand
+                        }
                     }
-                },
-                None => call,
-            };
-            let position_strand = match motif_info {
-                Some(motif_info) if self.combine_strands => {
-                    let (rpos, strand) = position_strand;
-                    if strand == Strand::Negative {
-                        (
-                            rpos.saturating_sub(
-                                (motif_info.reverse_offset
-                                    - motif_info.forward_offset)
-                                    as u32,
-                            ),
-                            Strand::Positive,
-                        )
-                    } else {
-                        position_strand
+                    _ => position_strand,
+                };
+
+                let counted = tally_table.add_call(
+                    position_strand,
+                    call,
+                    motif_idxs,
+                    self.max_depth,
+                );
+                if prob_stats && counted {
+                    match call {
+                        Call::Filtered(primary_base)
+                        | Call::CanonicalCall { primary_base, .. }
+                        | Call::ModifiedCall { primary_base, .. } => {
+                            prob_acc.add(
+                                position_strand.0,
+                                position_strand.1 == Strand::Negative,
+                                primary_base,
+                                mod_probs,
+                            );
+                        }
+                        Call::Delete | Call::NoCall(_) => {}
                     }
                 }
-                _ => position_strand,
             };
-
-            tally_table.add_call(
-                position_strand,
-                call,
-                motif_idxs,
-                self.max_depth,
-            );
-        };
 
         let mut mod_pos = Option::<usize>::None;
         let mut canonical_base = Option::<DnaBase>::None;
         let mut pos_base_mod_call = Option::<BaseModCall>::None;
         let mut mod_strand = Option::<Strand>::None;
+        // probabilities of the pending modification call (mod_pos), and of
+        // implicitly canonical calls per primary base, for --prob-stats
+        let mut cur_probs: Vec<(ModCodeRepr, f32)> = Vec::new();
+        let mut implicit_probs: [Vec<(ModCodeRepr, f32)>; 4] =
+            Default::default();
         'records: for record in records {
             let reverse = record.is_reverse();
             let seq_enc = record.seq().encoded;
@@ -650,6 +762,14 @@ impl PileupWorker for GenericPileupWorker {
             let mm_tag_infos = MmTagInfo::from_record(&record)?;
             let (bases_to_codes, implicit_bases) =
                 get_base_codes_and_implicits(&mm_tag_infos);
+            if prob_stats {
+                for (probs, codes) in
+                    implicit_probs.iter_mut().zip(bases_to_codes.iter())
+                {
+                    probs.clear();
+                    probs.extend(codes.iter().map(|&c| (c, 0f32)));
+                }
+            }
 
             let Ok(_) = update_mods_iter2(
                 &mut modbase_iter,
@@ -659,6 +779,7 @@ impl PileupWorker for GenericPileupWorker {
                 &mut mod_strand,
                 reverse,
                 &self.caller,
+                prob_stats.then_some(&mut cur_probs),
             ) else {
                 erred_records = erred_records.saturating_add(1);
                 continue 'records;
@@ -744,6 +865,7 @@ impl PileupWorker for GenericPileupWorker {
                             call,
                             ref_base,
                             motif_idxs,
+                            &cur_probs,
                         );
 
                         let Ok(_) = update_mods_iter2(
@@ -754,6 +876,7 @@ impl PileupWorker for GenericPileupWorker {
                             &mut mod_strand,
                             reverse,
                             &self.caller,
+                            prob_stats.then_some(&mut cur_probs),
                         ) else {
                             erred_records = erred_records.saturating_add(1);
                             continue 'records;
@@ -762,7 +885,8 @@ impl PileupWorker for GenericPileupWorker {
                     }
                     (Some(q), Some(mp)) if q < mp => {
                         let base = {
-                            let Ok(tmp) = DnaBase::try_from(decode_base(seq_enc, q))
+                            let Ok(tmp) =
+                                DnaBase::try_from(decode_base(seq_enc, q))
                             else {
                                 erred_records = erred_records.saturating_add(1);
                                 continue 'records;
@@ -782,6 +906,7 @@ impl PileupWorker for GenericPileupWorker {
                                 },
                                 ref_base,
                                 motif_idxs,
+                                &implicit_probs[base as usize],
                             );
                         } else {
                             add_to_tally(
@@ -789,6 +914,7 @@ impl PileupWorker for GenericPileupWorker {
                                 Call::NoCall(base),
                                 ref_base,
                                 motif_idxs,
+                                &[],
                             );
                         }
                     }
@@ -806,6 +932,19 @@ impl PileupWorker for GenericPileupWorker {
                             if q > pos {
                                 continue 'overran;
                             } else {
+                                if prob_stats {
+                                    cur_probs.clear();
+                                    cur_probs.extend(codes.iter().map(
+                                        |hts_code| {
+                                            (
+                                                ModCodeRepr::from(
+                                                    hts_code.modified_base,
+                                                ),
+                                                qual_to_prob(hts_code.qual),
+                                            )
+                                        },
+                                    ));
+                                }
                                 let probs = codes
                                     .iter()
                                     .map(|hts_code| {
@@ -855,6 +994,7 @@ impl PileupWorker for GenericPileupWorker {
                                         ),
                                         ref_base,
                                         motif_idxs,
+                                        &cur_probs,
                                     );
                                     mod_pos = Some(pos);
                                     canonical_base = Some(can_base);
@@ -864,9 +1004,10 @@ impl PileupWorker for GenericPileupWorker {
                                 } else {
                                     assert!(pos > q);
                                     let base = {
-                                        let tmp =
-                                            DnaBase::try_from(decode_base(seq_enc, q))
-                                                .unwrap();
+                                        let tmp = DnaBase::try_from(
+                                            decode_base(seq_enc, q),
+                                        )
+                                        .unwrap();
                                         if record.is_reverse() {
                                             tmp.complement()
                                         } else {
@@ -883,6 +1024,7 @@ impl PileupWorker for GenericPileupWorker {
                                             },
                                             ref_base,
                                             motif_idxs,
+                                            &implicit_probs[base as usize],
                                         );
                                     } else {
                                         add_to_tally(
@@ -890,6 +1032,7 @@ impl PileupWorker for GenericPileupWorker {
                                             Call::NoCall(base),
                                             ref_base,
                                             motif_idxs,
+                                            &[],
                                         );
                                     }
                                     mod_pos = Some(pos);
@@ -908,12 +1051,14 @@ impl PileupWorker for GenericPileupWorker {
                             Call::Delete,
                             ref_base,
                             motif_idxs,
+                            &[],
                         );
                     }
                     (Some(q), None) => {
                         let base = {
                             let tmp =
-                                DnaBase::try_from(decode_base(seq_enc, q)).unwrap();
+                                DnaBase::try_from(decode_base(seq_enc, q))
+                                    .unwrap();
                             if record.is_reverse() {
                                 tmp.complement()
                             } else {
@@ -929,6 +1074,7 @@ impl PileupWorker for GenericPileupWorker {
                                 },
                                 ref_base,
                                 motif_idxs,
+                                &implicit_probs[base as usize],
                             );
                         } else {
                             add_to_tally(
@@ -936,6 +1082,7 @@ impl PileupWorker for GenericPileupWorker {
                                 Call::NoCall(base),
                                 ref_base,
                                 motif_idxs,
+                                &[],
                             );
                         }
                     }
@@ -957,6 +1104,16 @@ impl PileupWorker for GenericPileupWorker {
             self.combine_strands,
             &mut position_feature_counts,
         );
+        if self.prob_stats {
+            self.prob_acc.stats_for_rows(
+                start_pos,
+                &position_feature_counts,
+                combine_mods,
+                &mut pileup_space.prob_stats,
+            );
+        } else {
+            pileup_space.prob_stats.clear();
+        }
 
         pileup_space.chrom_name = chrom_name;
         pileup_space.interval_width = width;
@@ -2327,7 +2484,7 @@ impl TallyTable {
         call: Call,
         motif_idxs: u8,
         max_coverage: u16,
-    ) {
+    ) -> bool {
         let idx = Self::index(position_strand);
         self.touched_lo = self.touched_lo.min(idx);
         self.touched_hi = self.touched_hi.max(idx);
@@ -2335,7 +2492,7 @@ impl TallyTable {
         pc.motif_idxs.bitor_assign(motif_idxs);
         pc.total_cov = pc.total_cov.saturating_add(1);
         if pc.total_cov > max_coverage {
-            return;
+            return false;
         }
         match call {
             Call::Delete => {
@@ -2375,6 +2532,7 @@ impl TallyTable {
                 }
             }
         }
+        true
     }
 
     #[inline]
@@ -2531,10 +2689,20 @@ fn update_mods_iter2<'a>(
     mod_strand: &mut Option<Strand>,
     reverse: bool,
     caller: &MultipleThresholdModCaller,
+    probs_out: Option<&mut Vec<(ModCodeRepr, f32)>>,
 ) -> MkResult<()> {
     if let Some(res) = modbase_iter.next() {
         match res {
             Ok((pos, codes)) => {
+                if let Some(probs_out) = probs_out {
+                    probs_out.clear();
+                    probs_out.extend(codes.iter().map(|hts_code| {
+                        (
+                            ModCodeRepr::from(hts_code.modified_base),
+                            qual_to_prob(hts_code.qual),
+                        )
+                    }));
+                }
                 let pos = pos as usize;
                 let Ok(can_base) = DnaBase::try_from(codes[0].canonical_base)
                 else {

@@ -64,6 +64,11 @@ pub(crate) struct BaseModsAdapter<'a, const SIZE: usize = 16> {
     /// adjusted) base doesn't match any MM-tag canonical base are no-ops and
     /// can be skipped.
     scan_mask: [bool; 16],
+    /// When set, the probability of each modification code at the most
+    /// recent position returned by `next_modified_position` is recorded.
+    record_probs: bool,
+    last_probs: [(ModCodeRepr, f32); SIZE],
+    last_n_probs: usize,
 }
 
 impl<'a, const SIZE: usize> BaseModsAdapter<'a, SIZE> {
@@ -247,7 +252,26 @@ impl<'a, const SIZE: usize> BaseModsAdapter<'a, SIZE> {
             reverse,
             left_to_right_seq_pos: 0,
             scan_mask,
+            record_probs: false,
+            last_probs: [(ModCodeRepr::Code('N'), 0f32); SIZE],
+            last_n_probs: 0,
         })
+    }
+
+    /// Record per-modification-code probabilities at each position returned
+    /// by `next_modified_position`, see `last_mod_probs`.
+    pub fn set_record_probs(&mut self, record_probs: bool) {
+        self.record_probs = record_probs;
+    }
+
+    /// Probabilities of each modification code for the primary base at the
+    /// position most recently returned by `next_modified_position`. Codes
+    /// with an explicit call report the ML probability, codes in implicit
+    /// mode without an explicit call report 0. Codes in explicit ('?') mode
+    /// without a call at this position are omitted. Empty unless
+    /// `set_record_probs(true)` has been called.
+    pub fn last_mod_probs(&self) -> &[(ModCodeRepr, f32)] {
+        &self.last_probs[..self.last_n_probs]
     }
 
     pub fn next_modified_position_no_thresh(
@@ -331,6 +355,28 @@ impl<'a, const SIZE: usize> BaseModsAdapter<'a, SIZE> {
                     }
                     total_mod_qual = total_mod_qual.saturating_add(q);
                 }
+            }
+            if self.record_probs {
+                let mut n = 0usize;
+                for i in 0..self.n_codes {
+                    if self.canonical_bases[i] != base {
+                        continue;
+                    }
+                    match self.mm_next[i] {
+                        Some(0) => {
+                            let q = self.ml.get(self.ml_pos[i]).unwrap();
+                            self.last_probs[n] =
+                                (self.mod_codes[i], qual_to_prob(q));
+                            n += 1;
+                        }
+                        _ if self.implicits[i] => {
+                            self.last_probs[n] = (self.mod_codes[i], 0f32);
+                            n += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                self.last_n_probs = n;
             }
             let canonical_qual = 255u8.checked_sub(total_mod_qual).unwrap();
             let primary_base = DnaBase::parse(base as char).unwrap();

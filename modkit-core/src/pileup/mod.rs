@@ -13,6 +13,7 @@ pub(crate) mod base_mods_adapter;
 pub(crate) mod bedrmod;
 pub(crate) mod duplex;
 pub(super) mod pileup_processor;
+pub(crate) mod prob_stats;
 pub mod subcommand;
 
 #[derive(Debug, Copy, Clone, new)]
@@ -172,6 +173,9 @@ pub struct ModBasePileup2 {
     pub(crate) stride: usize,
     pub(crate) failed_records: usize,
     pub(crate) phased_feature_counts: [Vec<PileupFeatureCounts2>; 2],
+    /// Probability statistics aligned with `position_feature_counts`, only
+    /// populated with `--prob-stats`.
+    pub(crate) prob_stats: Vec<prob_stats::ProbStats>,
 }
 
 impl ModBasePileup2 {
@@ -183,6 +187,7 @@ impl ModBasePileup2 {
             stride: 0,
             failed_records: 0,
             phased_feature_counts: [Vec::new(), Vec::new()],
+            prob_stats: Vec::new(),
         }
     }
 }

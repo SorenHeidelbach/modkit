@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Adds
+  - [pileup] Adds `--prob-stats` to append per-position base modification probability statistics (`n_prob`, `mean_prob`, `sd_prob`, `q25_prob`, `median_prob`, `q75_prob`, `mean_confidence`) to the bedMethyl output. The standard 18 columns are unchanged.
+### Changes
+  - [pileup] Faster pileup with lower memory use, especially without `--modified-bases` (about 3x faster on the default path). Output is unchanged.
+
 ## [v0.6.4]
 ### Adds
   - [bedmethyl] Adds `--min-samples` (an integer or `all`) and `--min-sample-coverage` to `bedmethyl merge` to require a position to be present in (and optionally covered to a minimum valid depth in) multiple inputs, enabling an inner join across replicates. Omitting them preserves the original outer-join behaviour.

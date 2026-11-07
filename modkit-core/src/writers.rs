@@ -34,6 +34,7 @@ use crate::mod_base_code::{
 };
 use crate::pileup::bedrmod::BedRModArgs;
 use crate::pileup::duplex::DuplexModBasePileup;
+use crate::pileup::prob_stats::{ProbStats, PROB_STATS_HEADER_FIELDS};
 use crate::pileup::{ModBasePileup2, PileupFeatureCounts2};
 use crate::sample_probs::PercentileThresholdQual;
 use crate::summarize::ModSummary;
@@ -66,6 +67,7 @@ pub struct BedMethylWriter2<T: Write> {
 impl BedMethylWriter2<BufWriter<std::io::Stdout>> {
     pub(crate) fn new_stdout(
         with_header: bool,
+        prob_stats: bool,
         bed_rmod_args: &BedRModArgs,
         header: &HeaderView,
         modified_bases_options: Option<&Vec<ModifiedBasesOptions>>,
@@ -77,7 +79,9 @@ impl BedMethylWriter2<BufWriter<std::io::Stdout>> {
         write_pb.set_position(0);
         let mut writer = RecordingWriter::new_stdout(write_pb);
         if with_header {
-            writer.write(bedmethyl_header().as_bytes())?;
+            writer.write(
+                bedmethyl_header_with_prob_stats(prob_stats).as_bytes(),
+            )?;
         } else if bed_rmod_args.enabled() {
             let modified_bases_options =
                 modified_bases_options.ok_or_else(|| {
@@ -102,6 +106,7 @@ impl BedMethylWriter2<ParCompress<Bgzf>> {
     pub(crate) fn new_bgzf(
         out_path: &PathBuf,
         with_header: bool,
+        prob_stats: bool,
         bed_rmod_args: &BedRModArgs,
         header: &HeaderView,
         modified_bases_options: Option<&Vec<ModifiedBasesOptions>>,
@@ -120,7 +125,9 @@ impl BedMethylWriter2<ParCompress<Bgzf>> {
         write_pb.set_position(0);
         let mut writer = RecordingWriter::new_bgzf(fh, bgzf_threads, write_pb);
         if with_header {
-            writer.write(bedmethyl_header().as_bytes())?;
+            writer.write(
+                bedmethyl_header_with_prob_stats(prob_stats).as_bytes(),
+            )?;
         } else if bed_rmod_args.enabled() {
             let modified_bases_options =
                 modified_bases_options.ok_or_else(|| {
@@ -144,6 +151,7 @@ impl BedMethylWriter2<BufWriter<File>> {
     pub(crate) fn new(
         out_path: &PathBuf,
         with_header: bool,
+        prob_stats: bool,
         bed_rmod_args: &BedRModArgs,
         header: &HeaderView,
         modified_bases_options: Option<&Vec<ModifiedBasesOptions>>,
@@ -161,7 +169,9 @@ impl BedMethylWriter2<BufWriter<File>> {
         write_pb.set_position(0);
         let mut writer = RecordingWriter::new_file(fh, write_pb);
         if with_header {
-            writer.write(bedmethyl_header().as_bytes())?;
+            writer.write(
+                bedmethyl_header_with_prob_stats(prob_stats).as_bytes(),
+            )?;
         } else if bed_rmod_args.enabled() {
             let modified_bases_options =
                 modified_bases_options.ok_or_else(|| {
@@ -191,12 +201,20 @@ impl<T: Write> PileupWriter<ModBasePileup2> for BedMethylWriter2<T> {
         self.buff.set_position(0);
         let n_rows = item.position_feature_counts.len() as u64;
         let chrom_name = &item.chrom_name;
-        for pfc in item.position_feature_counts.iter() {
+        let prob_stats = (!item.prob_stats.is_empty()).then(|| {
+            debug_assert_eq!(
+                item.prob_stats.len(),
+                item.position_feature_counts.len()
+            );
+            &item.prob_stats
+        });
+        for (i, pfc) in item.position_feature_counts.iter().enumerate() {
             format_feature_counts2(
                 chrom_name,
                 &mut self.buff,
                 pfc,
                 self.bedrmod_spec,
+                prob_stats.map(|x| &x[i]),
             )
             .unwrap();
             let pos = self.buff.position() as usize;
@@ -214,6 +232,18 @@ impl<T: Write> PileupWriter<ModBasePileup2> for BedMethylWriter2<T> {
 
 pub fn bedmethyl_header() -> String {
     bedmethyl_header_op("valid_coverage")
+}
+
+/// bedMethyl header, with the `--prob-stats` columns appended when
+/// requested.
+pub(crate) fn bedmethyl_header_with_prob_stats(prob_stats: bool) -> String {
+    let header = bedmethyl_header();
+    if prob_stats {
+        let extra = PROB_STATS_HEADER_FIELDS.join("\t");
+        format!("{}\t{extra}\n", header.trim_end_matches('\n'))
+    } else {
+        header
+    }
 }
 
 pub fn bedrmod_bedmethyl_header() -> String {
@@ -402,6 +432,7 @@ pub struct MultipleMotifBedmethylWriter<T: Write> {
 impl MultipleMotifBedmethylWriter<BufWriter<std::io::Stdout>> {
     pub(crate) fn new_stdout(
         with_header: bool,
+        prob_stats: bool,
         bed_rmod_args: &BedRModArgs,
         header: &HeaderView,
         modified_bases_options: Option<&Vec<ModifiedBasesOptions>>,
@@ -410,7 +441,9 @@ impl MultipleMotifBedmethylWriter<BufWriter<std::io::Stdout>> {
     ) -> anyhow::Result<Self> {
         let mut writer = BufWriter::new(stdout());
         if with_header {
-            writer.write(bedmethyl_header().as_bytes())?;
+            writer.write(
+                bedmethyl_header_with_prob_stats(prob_stats).as_bytes(),
+            )?;
         } else if bed_rmod_args.enabled() {
             let modified_bases_options =
                 modified_bases_options.ok_or_else(|| {
@@ -434,6 +467,7 @@ impl MultipleMotifBedmethylWriter<BufWriter<File>> {
     pub(crate) fn new_file(
         out_path: &PathBuf,
         with_header: bool,
+        prob_stats: bool,
         bed_rmod_args: &BedRModArgs,
         header: &HeaderView,
         modified_bases_options: Option<&Vec<ModifiedBasesOptions>>,
@@ -452,7 +486,9 @@ impl MultipleMotifBedmethylWriter<BufWriter<File>> {
 
         let mut writer = RecordingWriter::new_file(fh, write_pb);
         if with_header {
-            writer.write(bedmethyl_header().as_bytes())?;
+            writer.write(
+                bedmethyl_header_with_prob_stats(prob_stats).as_bytes(),
+            )?;
         } else if bed_rmod_args.enabled() {
             let modified_bases_options =
                 modified_bases_options.ok_or_else(|| {
@@ -471,6 +507,7 @@ impl MultipleMotifBedmethylWriter<ParCompress<Bgzf>> {
     pub(crate) fn new_bgzf(
         out_path: &PathBuf,
         with_header: bool,
+        prob_stats: bool,
         bed_rmod_args: &BedRModArgs,
         header: &HeaderView,
         modified_bases_options: Option<&Vec<ModifiedBasesOptions>>,
@@ -490,7 +527,9 @@ impl MultipleMotifBedmethylWriter<ParCompress<Bgzf>> {
 
         let mut writer = RecordingWriter::new_bgzf(fh, bgzf_threads, write_pb);
         if with_header {
-            writer.write(bedmethyl_header().as_bytes())?;
+            writer.write(
+                bedmethyl_header_with_prob_stats(prob_stats).as_bytes(),
+            )?;
         } else if bed_rmod_args.enabled() {
             let modified_bases_options =
                 modified_bases_options.ok_or_else(|| {
@@ -515,8 +554,11 @@ impl<T: Write> PileupWriter<ModBasePileup2>
     ) -> anyhow::Result<u64> {
         let mut rows_written = 0u64;
         let chrom_name = &item.chrom_name;
-        let mut buff = Cursor::new([0u8; 512]);
-        for feature_count in item.position_feature_counts.iter() {
+        let mut buff = Cursor::new([0u8; 1024]);
+        for (i, feature_count) in
+            item.position_feature_counts.iter().enumerate()
+        {
+            let prob_stats = item.prob_stats.get(i);
             let idxs = feature_count.motif_idxs.view_bits::<Lsb0>().iter_ones();
             for idx in idxs {
                 let motif_label = &motif_labels[idx];
@@ -548,7 +590,11 @@ impl<T: Write> PileupWriter<ModBasePileup2>
                 write!(&mut buff, "{}{TAB}", feature_count.n_delete)?;
                 write!(&mut buff, "{}{TAB}", feature_count.n_filtered)?;
                 write!(&mut buff, "{}{TAB}", feature_count.n_diff)?;
-                write!(&mut buff, "{}\n", feature_count.n_nocall)?;
+                write!(&mut buff, "{}", feature_count.n_nocall)?;
+                if let Some(prob_stats) = prob_stats {
+                    prob_stats.write_columns(&mut buff)?;
+                }
+                write!(&mut buff, "\n")?;
                 let pos = buff.position() as usize;
 
                 self.writer
@@ -1206,6 +1252,7 @@ fn format_feature_counts2(
     buff: &mut Cursor<Vec<u8>>,
     feature_count: &PileupFeatureCounts2,
     bedrmod_spec: bool,
+    prob_stats: Option<&ProbStats>,
 ) -> anyhow::Result<()> {
     let pos = feature_count.position;
     let pp1 = pos + 1;
@@ -1231,7 +1278,11 @@ fn format_feature_counts2(
     write!(buff, "{}{TAB}", feature_count.n_delete)?;
     write!(buff, "{}{TAB}", feature_count.n_filtered)?;
     write!(buff, "{}{TAB}", feature_count.n_diff)?;
-    write!(buff, "{}\n", feature_count.n_nocall)?;
+    write!(buff, "{}", feature_count.n_nocall)?;
+    if let Some(prob_stats) = prob_stats {
+        prob_stats.write_columns(buff)?;
+    }
+    write!(buff, "\n")?;
     Ok(())
 }
 
@@ -1423,8 +1474,10 @@ where
             let hp1_handle = scope.spawn(|| {
                 let mut buff = Cursor::new(vec![0u8; 1 << 20]);
                 for pfc in hp1.iter().filter(|x| x.is_valid()) {
-                    format_feature_counts2(chrom_name, &mut buff, pfc, false)
-                        .unwrap();
+                    format_feature_counts2(
+                        chrom_name, &mut buff, pfc, false, None,
+                    )
+                    .unwrap();
                     let pos = buff.position() as usize;
                     if pos >= 1 << 20 {
                         self.hp1_writer.write(&buff.get_ref()[..pos]).unwrap();
@@ -1437,8 +1490,10 @@ where
             let hp2_handle = scope.spawn(|| {
                 let mut buff = Cursor::new(vec![0u8; 1 << 20]);
                 for pfc in hp2.iter().filter(|x| x.is_valid()) {
-                    format_feature_counts2(chrom_name, &mut buff, pfc, false)
-                        .unwrap();
+                    format_feature_counts2(
+                        chrom_name, &mut buff, pfc, false, None,
+                    )
+                    .unwrap();
                     let pos = buff.position() as usize;
                     if pos >= 1 << 20 {
                         self.hp2_writer.write(&buff.get_ref()[..pos]).unwrap();
@@ -1451,8 +1506,14 @@ where
             let combined_handle = scope.spawn(|| {
                 let mut buff = Cursor::new(vec![0u8; 1 << 20]);
                 for pfc in combined_counts.iter().filter(|x| x.is_valid()) {
-                    format_feature_counts2(&chrom_name, &mut buff, pfc, false)
-                        .unwrap();
+                    format_feature_counts2(
+                        &chrom_name,
+                        &mut buff,
+                        pfc,
+                        false,
+                        None,
+                    )
+                    .unwrap();
                     let pos = buff.position() as usize;
                     if pos >= 1 << 20 {
                         self.combined_writer

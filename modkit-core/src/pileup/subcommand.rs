@@ -405,6 +405,21 @@ pub struct ModBamPileup {
         default_value_t = false
     )]
     with_header: bool,
+    /// Append per-position base modification probability statistics to each
+    /// bedMethyl record: n_prob, mean_prob, sd_prob, q25_prob, median_prob,
+    /// q75_prob, and mean_confidence. These summarize the per-read
+    /// probability of the record's modification code (the summed
+    /// modification probability with --combine-mods) over all reads with a
+    /// call at the position, including calls that failed the filter
+    /// threshold. mean_confidence is the mean probability of the most likely
+    /// class (canonical or modified). The first 18 columns are unchanged.
+    #[clap(help_heading = "Output Options")]
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with_all = ["phased", "bedrmod"]
+    )]
+    prob_stats: bool,
     /// Prefix to prepend on phased output file names. Without this option
     /// the files will be <mod_code>_<strand>.bedmethyl
     #[clap(help_heading = "Output Options")]
@@ -1100,6 +1115,7 @@ impl ModBamPileup {
                         debug!("using multiple-motif stdout writer");
                         Box::new(MultipleMotifBedmethylWriter::new_stdout(
                             self.with_header,
+                            self.prob_stats,
                             &self.bedrmodargs,
                             &header,
                             self.modified_bases.as_ref(),
@@ -1110,6 +1126,7 @@ impl ModBamPileup {
                         debug!("using standard stdout writer");
                         Box::new(BedMethylWriter2::new_stdout(
                             self.with_header,
+                            self.prob_stats,
                             &self.bedrmodargs,
                             &header,
                             self.modified_bases.as_ref(),
@@ -1131,6 +1148,7 @@ impl ModBamPileup {
                             Box::new(MultipleMotifBedmethylWriter::new_bgzf(
                                 &Path::new(&out_fp_str).to_path_buf(),
                                 self.with_header,
+                                self.prob_stats,
                                 &self.bedrmodargs,
                                 &header,
                                 self.modified_bases.as_ref(),
@@ -1142,6 +1160,7 @@ impl ModBamPileup {
                             Box::new(MultipleMotifBedmethylWriter::new_file(
                                 &Path::new(&out_fp_str).to_path_buf(),
                                 self.with_header,
+                                self.prob_stats,
                                 &self.bedrmodargs,
                                 &header,
                                 self.modified_bases.as_ref(),
@@ -1159,6 +1178,7 @@ impl ModBamPileup {
                             Box::new(BedMethylWriter2::new_bgzf(
                                 &Path::new(&out_fp_str).to_path_buf(),
                                 self.with_header,
+                                self.prob_stats,
                                 &self.bedrmodargs,
                                 &header,
                                 self.modified_bases.as_ref(),
@@ -1171,6 +1191,7 @@ impl ModBamPileup {
                             Box::new(BedMethylWriter2::new(
                                 &Path::new(&out_fp_str).to_path_buf(),
                                 self.with_header,
+                                self.prob_stats,
                                 &self.bedrmodargs,
                                 &header,
                                 self.modified_bases.as_ref(),
@@ -1310,6 +1331,7 @@ impl ModBamPileup {
                             edge_filter.as_ref(),
                             1,
                             u16::MAX,
+                            self.prob_stats,
                         )
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
@@ -1349,6 +1371,7 @@ impl ModBamPileup {
                             edge_filter.as_ref(),
                             0,
                             u16::MAX,
+                            self.prob_stats,
                         )
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
@@ -1393,6 +1416,7 @@ impl ModBamPileup {
                                 edge_filter.as_ref(),
                                 0,
                                 u16::MAX,
+                                self.prob_stats,
                             )
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
@@ -1461,6 +1485,7 @@ impl ModBamPileup {
                             edge_filter.as_ref(),
                             motif_offset as u32,
                             self.max_depth,
+                            self.prob_stats,
                         )?;
                         workers.push(Box::new(worker))
                     } else {
@@ -1482,6 +1507,7 @@ impl ModBamPileup {
                             edge_filter.as_ref(),
                             0,
                             self.max_depth,
+                            self.prob_stats,
                         )?;
                         workers.push(Box::new(worker))
                     }
@@ -1513,6 +1539,7 @@ impl ModBamPileup {
                             pileup_options.clone(),
                             self.combine_strands,
                             self.max_depth,
+                            self.prob_stats,
                         )
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
