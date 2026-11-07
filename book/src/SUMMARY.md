@@ -10,6 +10,7 @@
     - [Calculating modification statistics in regions](./intro_stats.md)
     - [Calling mods in a modBAM](./intro_call_mods.md)
     - [Removing modification calls at the ends of reads](./intro_edge_filter.md)
+    - [Aligning a modBAM to a reference](./intro_align.md)
     - [Repair MM/ML tags on trimmed reads](./intro_repair.md)
     - [Working with sequence motifs](./intro_motif.md)
         - [Making a motif BED file](./intro_motif_bed.md)

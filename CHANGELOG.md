@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Adds
+  - [modbam] Adds `modbam align`, aligns reads in a modBAM to a reference with an embedded minimap2. MM/ML and other per-read tags are kept valid on all output records (supplementary alignments are soft-clipped and `MN` is set), no FASTQ conversion needed.
+
+
 ## [v0.6.4]
 ### Adds
   - [bedmethyl] Adds `--min-samples` (an integer or `all`) and `--min-sample-coverage` to `bedmethyl merge` to require a position to be present in (and optionally covered to a minimum valid depth in) multiple inputs, enabling an inner join across replicates. Omitting them preserves the original outer-join behaviour.

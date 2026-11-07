@@ -18,6 +18,7 @@ use modkit_logging::init_logging;
 use rustc_hash::FxHashMap;
 
 use crate::adjust::adjust_modbam;
+use crate::align::AlignModBam;
 use crate::command_utils::{
     get_bam_writer, get_motif_lookup_from_parts, get_serial_reader,
     get_threshold_from_options, parse_edge_filter_input, parse_forward_motifs,
@@ -62,6 +63,10 @@ use crate::writers::{
 
 #[derive(Subcommand)]
 pub enum EntryModBam {
+    /// Align reads in a modBAM to a reference with minimap2, keeping the
+    /// base modification tags (MM/ML) valid on every output record. Reads can
+    /// be unaligned or previously aligned.
+    Align(AlignModBam),
     #[command(name = "check-tags")]
     CheckTags(EntryCheckTags),
     // SampleReads(EntrySampleReads),
@@ -98,6 +103,7 @@ pub enum EntryModBam {
 impl EntryModBam {
     pub fn run(&self) -> anyhow::Result<()> {
         match self {
+            EntryModBam::Align(x) => x.run(),
             EntryModBam::CheckTags(x) => x.run(),
             EntryModBam::AdjustMods(adjust) => adjust.run(),
             EntryModBam::UpdateTags(update) => update.run(),

@@ -1,6 +1,7 @@
 extern crate core;
 
 pub mod adjust;
+pub mod align;
 pub mod bedmethyl_util;
 // pub mod commands;
 pub mod command_utils;
