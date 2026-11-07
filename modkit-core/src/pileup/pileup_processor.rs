@@ -767,9 +767,16 @@ impl PileupWorker for GenericPileupWorker {
                 continue 'records;
             };
 
-            let mm_tag_infos = MmTagInfo::from_record(&record)?;
+            // for tags parsed by the fast parser, `MmTagInfo::from_record`
+            // gives the same codes and modes (and can't fail)
             let (bases_to_codes, implicit_bases) =
-                get_base_codes_and_implicits(&mm_tag_infos);
+                match modbase_iter.fast_buffers() {
+                    Some(buffers) => buffers.base_codes_and_implicits(),
+                    None => {
+                        let mm_tag_infos = MmTagInfo::from_record(&record)?;
+                        get_base_codes_and_implicits(&mm_tag_infos)
+                    }
+                };
             if prob_stats {
                 for (probs, codes) in
                     implicit_probs.iter_mut().zip(bases_to_codes.iter())
@@ -2626,7 +2633,7 @@ impl TallyTable {
 
 type PositionStrand = (u32, Strand);
 
-fn get_base_codes_and_implicits(
+pub(crate) fn get_base_codes_and_implicits(
     mm_tag_infos: &[MmTagInfo],
 ) -> ([Vec<ModCodeRepr>; 4], [bool; 4]) {
     let mut codes: [Vec<ModCodeRepr>; 4] = Default::default();

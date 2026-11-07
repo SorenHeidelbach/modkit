@@ -45,6 +45,8 @@ struct MmRecord {
     // index into `codes`
     codes_start: u16,
     n_codes: u16,
+    // '.' or no mode (as `MmTagInfo::is_implicit`)
+    implicit: bool,
     // this record's entries are entries[cursor..end], ascending SEQ
     // position, `n_codes` consecutive entries per position
     cursor: u32,
@@ -58,7 +60,37 @@ pub(crate) struct FastModsBuffers {
     records: Vec<MmRecord>,
     codes: Vec<ModCodeRepr>,
     deltas: Vec<u32>,
+    last_deltas: Vec<u32>,
     positions: Vec<u32>,
+}
+
+impl FastModsBuffers {
+    /// The modification codes per primary base and whether the base has
+    /// an implicit-mode MM record, the same as `get_base_codes_and_implicits`
+    /// gives for `MmTagInfo::from_record` of a simple tag.
+    pub(crate) fn base_codes_and_implicits(
+        &self,
+    ) -> ([Vec<ModCodeRepr>; 4], [bool; 4]) {
+        let mut codes: [Vec<ModCodeRepr>; 4] = Default::default();
+        let mut implicits = [false; 4];
+        for r in self.records.iter() {
+            let idx = match r.base {
+                b'A' => 0,
+                b'C' => 1,
+                b'G' => 2,
+                b'T' => 3,
+                _ => unreachable!("only ACGT records are parsed"),
+            };
+            codes[idx].extend_from_slice(
+                &self.codes[r.codes_start as usize
+                    ..(r.codes_start + r.n_codes) as usize],
+            );
+            if r.implicit {
+                implicits[idx] = true;
+            }
+        }
+        (codes, implicits)
+    }
 }
 
 /// Iterator over explicit modification calls in SEQ coordinates, either
@@ -69,6 +101,14 @@ pub(crate) enum ModCallsIter<'a> {
 }
 
 impl<'a> ModCallsIter<'a> {
+    /// The parse buffers when the tags were parsed here (not by htslib).
+    pub(crate) fn fast_buffers(&self) -> Option<&FastModsBuffers> {
+        match self {
+            Self::Fast { buffers } => Some(buffers),
+            Self::Hts(_) => None,
+        }
+    }
+
     /// Equivalent to `record.basemods_position_iter()`, an error here is
     /// the same error htslib would give.
     pub(crate) fn new(
@@ -181,8 +221,14 @@ fn parse_simple(
         return None;
     }
 
-    let FastModsBuffers { entries, records, codes, deltas, positions } =
-        buffers;
+    let FastModsBuffers {
+        entries,
+        records,
+        codes,
+        deltas,
+        last_deltas,
+        positions,
+    } = buffers;
     entries.clear();
     records.clear();
     codes.clear();
@@ -230,10 +276,17 @@ fn parse_simple(
             return None;
         }
         // mode
-        match mm.get(i)? {
-            b'?' | b'.' => i += 1,
-            _ => {}
-        }
+        let implicit = match mm.get(i)? {
+            b'?' => {
+                i += 1;
+                false
+            }
+            b'.' => {
+                i += 1;
+                true
+            }
+            _ => true,
+        };
         // deltas
         deltas.clear();
         loop {
@@ -272,9 +325,14 @@ fn parse_simple(
 
         // map deltas to SEQ positions; in read orientation the base is
         // `base`, for reverse reads that is the complement read from the end
-        // of SEQ
-        positions.clear();
-        if !deltas.is_empty() {
+        // of SEQ. MM records for the same base often share the deltas (e.g.
+        // C+h?/C+m?), then the positions of the previous record are reused.
+        let reuse = records.last().map(|r| r.base == base).unwrap_or(false)
+            && last_deltas == deltas;
+        if !reuse {
+            positions.clear();
+        }
+        if !reuse && !deltas.is_empty() {
             let seq_base_target = if reverse { complement(base) } else { base };
             let mut d = 0usize;
             let mut skip = deltas[0];
@@ -337,10 +395,12 @@ fn parse_simple(
             }
         }
         ml_idx += n_ml;
+        std::mem::swap(last_deltas, deltas);
         records.push(MmRecord {
             base,
             codes_start: codes_start as u16,
             n_codes: n_codes as u16,
+            implicit,
             cursor: entries_start as u32,
             end: entries.len() as u32,
         });
@@ -502,6 +562,34 @@ mod fast_mods_tests {
                 for _ in 0..(deltas.len() * n_codes) {
                     ml.push(rng.below(256) as u8);
                 }
+                // sometimes a second record for the same base with the same
+                // deltas (like C+h?/C+m?)
+                if rng.below(2) == 0 {
+                    let code2 = code_choices[bi][rng.below(
+                        code_choices[bi].len() as u64,
+                    ) as usize];
+                    if !used_bases.iter().any(|(b, c)| *b == base && *c == code2)
+                    {
+                        used_bases.push((base, code2));
+                        let n_codes2 =
+                            if code2.chars().all(|c| c.is_ascii_digit()) {
+                                1
+                            } else {
+                                code2.len()
+                            };
+                        mm.push(base as char);
+                        mm.push('+');
+                        mm.push_str(code2);
+                        mm.push_str(["", "?", "."][rng.below(3) as usize]);
+                        for d in deltas.iter() {
+                            mm.push_str(&format!(",{d}"));
+                        }
+                        mm.push(';');
+                        for _ in 0..(deltas.len() * n_codes2) {
+                            ml.push(rng.below(256) as u8);
+                        }
+                    }
+                }
             }
             if mm.is_empty() {
                 continue;
@@ -510,6 +598,18 @@ mod fast_mods_tests {
             let expected = hts_calls(&record);
             let (is_fast, observed) = fast_calls(&record, &mut buffers);
             n_fast += is_fast as usize;
+            if is_fast {
+                parse_simple(&record, &mut buffers).unwrap();
+                let infos =
+                    crate::mod_bam::MmTagInfo::from_record(&record).unwrap();
+                assert_eq!(
+                    buffers.base_codes_and_implicits(),
+                    crate::pileup::pileup_processor::get_base_codes_and_implicits(
+                        &infos
+                    ),
+                    "{mm}"
+                );
+            }
             assert_eq!(
                 observed, expected,
                 "mm={mm} ml={ml:?} reverse={reverse} seq={}",
