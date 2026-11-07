@@ -11,6 +11,9 @@ pub struct MultipleThresholdModCaller {
     // todo maybe allow this per primary base?
     per_mod_thresholds: FxHashMap<ModCodeRepr, f32>,
     default_threshold: f32,
+    // the same thresholds, for fast lookups in `call_from_probs`
+    base_threshold_by_idx: [Option<f32>; 4],
+    mod_thresholds_vec: Vec<(ModCodeRepr, f32)>,
 }
 
 impl MultipleThresholdModCaller {
@@ -19,10 +22,20 @@ impl MultipleThresholdModCaller {
         per_mod_thresholds: HashMap<ModCodeRepr, f32>,
         default_threshold: f32,
     ) -> Self {
+        let mut base_threshold_by_idx = [None; 4];
+        for (base, t) in per_base_thresholds.iter() {
+            base_threshold_by_idx[*base as usize] = Some(*t);
+        }
+        let mod_thresholds_vec = per_mod_thresholds
+            .iter()
+            .map(|(c, t)| (*c, *t))
+            .collect::<Vec<_>>();
         Self {
             per_base_thresholds: per_base_thresholds.into_iter().collect(),
             per_mod_thresholds: per_mod_thresholds.into_iter().collect(),
             default_threshold,
+            base_threshold_by_idx,
+            mod_thresholds_vec,
         }
     }
 
@@ -31,6 +44,98 @@ impl MultipleThresholdModCaller {
             per_base_thresholds: FxHashMap::default(),
             per_mod_thresholds: FxHashMap::default(),
             default_threshold: 0f32,
+            base_threshold_by_idx: [None; 4],
+            mod_thresholds_vec: Vec::new(),
+        }
+    }
+
+    /// Same lookup as in `call`, using the precomputed thresholds.
+    #[inline]
+    fn mod_threshold(&self, mod_code: &ModCodeRepr, canonical_base: &DnaBase) -> f32 {
+        let find = |code: &ModCodeRepr| {
+            self.mod_thresholds_vec
+                .iter()
+                .find(|(c, _)| c == code)
+                .map(|(_, t)| *t)
+        };
+        find(mod_code)
+            .or_else(|| find(&ModCodeRepr::any_mod_code(canonical_base)))
+            .or(self.base_threshold_by_idx[*canonical_base as usize])
+            .unwrap_or(self.default_threshold)
+    }
+
+    /// Same result as
+    /// `self.call(canonical_base, &BaseModProbs::new(probs.iter().copied().collect(), false))`
+    /// without allocating in the common case. `call` takes the last maximum
+    /// in hash map iteration order, so when two modification codes tie for
+    /// the maximum (and the canonical probability doesn't win) the exact
+    /// original computation is used.
+    #[inline]
+    pub(crate) fn call_from_probs(
+        &self,
+        canonical_base: &DnaBase,
+        probs: &[(ModCodeRepr, f32)],
+    ) -> BaseModCall {
+        let fallback = || {
+            self.call(
+                canonical_base,
+                &BaseModProbs::new(probs.iter().copied().collect(), false),
+            )
+        };
+        if probs.len() > 8 {
+            return fallback();
+        }
+        let mut best: Option<(f32, ModCodeRepr)> = None;
+        let mut tie = false;
+        let mut sum = 0f32;
+        for (i, &(code, p)) in probs.iter().enumerate() {
+            // The sum of the probabilities (for the canonical probability)
+            // is computed in hash map order in `call`, it's only guaranteed
+            // to be the same in any order when every value is a multiple of
+            // 1/512, as ML-derived probabilities ((q + 0.5) / 256) are.
+            // Duplicate codes collapse in the hash map.
+            let k = p * 512f32;
+            if !(p.abs() <= 4f32)
+                || (k as i32) as f32 != k
+                || probs[..i].iter().any(|(c, _)| *c == code)
+            {
+                return fallback();
+            }
+            sum += p;
+            if p >= self.mod_threshold(&code, canonical_base) {
+                match best {
+                    None => best = Some((p, code)),
+                    Some((bp, _)) => {
+                        if p > bp {
+                            best = Some((p, code));
+                            tie = false;
+                        } else if p == bp {
+                            tie = true;
+                        }
+                    }
+                }
+            }
+        }
+        let canonical_prob = 1f32 - sum;
+        let canonical_threshold = self.base_threshold_by_idx
+            [*canonical_base as usize]
+            .unwrap_or(self.default_threshold);
+        if canonical_prob >= canonical_threshold {
+            // canonical is considered last, so it wins ties
+            match best {
+                None => return BaseModCall::Canonical(canonical_prob),
+                Some((bp, _)) if canonical_prob >= bp => {
+                    return BaseModCall::Canonical(canonical_prob)
+                }
+                _ => {}
+            }
+        }
+        if tie {
+            return fallback();
+        }
+        match best {
+            Some((p, code)) => BaseModCall::Modified(p, code),
+            None => BaseModCall::Filtered,
         }
     }
 
@@ -179,6 +284,73 @@ impl MultipleThresholdModCaller {
 
 #[cfg(test)]
 mod threshold_mod_caller_tests {
+    #[test]
+    fn test_call_from_probs_matches_call() {
+        use crate::mod_bam::BaseModProbs;
+        use crate::mod_base_code::{DnaBase, ModCodeRepr};
+        use crate::util::qual_to_prob;
+        use std::collections::HashMap;
+        let mut x = 0x2545F4914F6CDD1Du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let codes = [
+            ModCodeRepr::Code('h'),
+            ModCodeRepr::Code('m'),
+            ModCodeRepr::ChEbi(21839),
+            ModCodeRepr::Code('C'),
+            ModCodeRepr::Code('a'),
+        ];
+        let callers = [
+            MultipleThresholdModCaller::new_passthrough(),
+            MultipleThresholdModCaller::new(
+                HashMap::from([(DnaBase::C, 0.7), (DnaBase::A, 0.8)]),
+                HashMap::new(),
+                0.6,
+            ),
+            MultipleThresholdModCaller::new(
+                HashMap::from([(DnaBase::C, 0.75)]),
+                HashMap::from([(ModCodeRepr::Code('h'), 0.5)]),
+                0.0,
+            ),
+            MultipleThresholdModCaller::new(
+                HashMap::new(),
+                HashMap::from([(ModCodeRepr::Code('C'), 0.9)]),
+                0.3,
+            ),
+        ];
+        let mut n_ties = 0;
+        for i in 0..400_000u64 {
+            let caller = &callers[(i % callers.len() as u64) as usize];
+            let n = (next() % 4) as usize;
+            let mut probs = Vec::new();
+            for _ in 0..n {
+                let code = codes[(next() % codes.len() as u64) as usize];
+                // small quality range makes ties common
+                let q = if next() % 2 == 0 {
+                    (next() % 256) as u8
+                } else {
+                    (next() % 4) as u8 * 60
+                };
+                probs.push((code, qual_to_prob(q)));
+            }
+            let base = if next() % 2 == 0 { DnaBase::C } else { DnaBase::A };
+            let expected = caller.call(
+                &base,
+                &BaseModProbs::new(probs.iter().copied().collect(), false),
+            );
+            let observed = caller.call_from_probs(&base, &probs);
+            if probs.len() >= 2 && probs[0].1 == probs[1].1 {
+                n_ties += 1;
+            }
+            assert_eq!(format!("{observed:?}"), format!("{expected:?}"), "{probs:?}");
+        }
+        assert!(n_ties > 1000);
+    }
+
     use crate::mod_bam::{BaseModCall, BaseModProbs};
     use crate::mod_base_code::{DnaBase, ModCodeRepr, SIX_METHYL_ADENINE};
     use crate::threshold_mod_caller::MultipleThresholdModCaller;

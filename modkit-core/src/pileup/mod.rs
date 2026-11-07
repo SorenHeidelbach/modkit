@@ -11,6 +11,7 @@ use crate::util::StrandRule;
 pub(crate) mod base_mods_adapter;
 pub(crate) mod bedrmod;
 pub(super) mod pileup_processor;
+pub(crate) mod fast_mods;
 pub(crate) mod format;
 pub(crate) mod prob_stats;
 pub mod subcommand;

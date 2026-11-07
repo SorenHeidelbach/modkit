@@ -22,6 +22,7 @@ use crate::{
     motifs::motif_bed::MotifInfo,
     pileup::{
         base_mods_adapter::{decode_base, BaseModsAdapter, ModState},
+        fast_mods::{FastModsBuffers, ModCall, ModCallsIter},
         prob_stats::ProbAccumulator,
         ModBasePileup2, PileupFeatureCounts2, PileupNumericOptions,
     },
@@ -572,6 +573,7 @@ pub struct GenericPileupWorker {
     tally_table: TallyTable,
     prob_stats: bool,
     prob_acc: ProbAccumulator,
+    fast_mods_buffers: FastModsBuffers,
 }
 
 impl GenericPileupWorker {
@@ -631,6 +633,7 @@ impl GenericPileupWorker {
             tally_table: TallyTable::default(),
             prob_stats,
             prob_acc: ProbAccumulator::default(),
+            fast_mods_buffers: FastModsBuffers::default(),
         })
     }
 }
@@ -744,6 +747,9 @@ impl PileupWorker for GenericPileupWorker {
         // probabilities of the pending modification call (mod_pos), and of
         // implicitly canonical calls per primary base, for --prob-stats
         let mut cur_probs: Vec<(ModCodeRepr, f32)> = Vec::new();
+        // reused buffers for the calls and probabilities at a position
+        let mut calls_buf: Vec<ModCall> = Vec::new();
+        let mut probs_buf: Vec<(ModCodeRepr, f32)> = Vec::new();
         let mut implicit_probs: [Vec<(ModCodeRepr, f32)>; 4] =
             Default::default();
         'records: for record in records {
@@ -754,7 +760,9 @@ impl PileupWorker for GenericPileupWorker {
             } else {
                 Strand::Positive
             };
-            let Ok(mut modbase_iter) = record.basemods_position_iter() else {
+            let Ok(mut modbase_iter) =
+                ModCallsIter::new(&record, &mut self.fast_mods_buffers)
+            else {
                 erred_records = erred_records.saturating_add(1);
                 continue 'records;
             };
@@ -773,6 +781,8 @@ impl PileupWorker for GenericPileupWorker {
 
             let Ok(_) = update_mods_iter2(
                 &mut modbase_iter,
+                &mut calls_buf,
+                &mut probs_buf,
                 &mut mod_pos,
                 &mut canonical_base,
                 &mut pos_base_mod_call,
@@ -870,6 +880,8 @@ impl PileupWorker for GenericPileupWorker {
 
                         let Ok(_) = update_mods_iter2(
                             &mut modbase_iter,
+                            &mut calls_buf,
+                            &mut probs_buf,
                             &mut mod_pos,
                             &mut canonical_base,
                             &mut pos_base_mod_call,
@@ -923,66 +935,29 @@ impl PileupWorker for GenericPileupWorker {
                         canonical_base = None;
                         pos_base_mod_call = None;
                         mod_strand = None;
-                        'overran: while let Some(r) = modbase_iter.next() {
-                            let Ok((pos, codes)) = r else {
+                        'overran: while let Some(r) =
+                            modbase_iter.next_into(&mut calls_buf)
+                        {
+                            let Ok(pos) = r else {
                                 erred_records = erred_records.saturating_add(1);
                                 continue 'records;
                             };
-                            let pos = pos as usize;
                             if q > pos {
                                 continue 'overran;
                             } else {
-                                if prob_stats {
-                                    cur_probs.clear();
-                                    cur_probs.extend(codes.iter().map(
-                                        |hts_code| {
-                                            (
-                                                ModCodeRepr::from(
-                                                    hts_code.modified_base,
-                                                ),
-                                                qual_to_prob(hts_code.qual),
-                                            )
-                                        },
-                                    ));
-                                }
-                                let probs = codes
-                                    .iter()
-                                    .map(|hts_code| {
-                                        let mod_code = ModCodeRepr::from(
-                                            hts_code.modified_base,
-                                        );
-                                        let prob = qual_to_prob(hts_code.qual);
-                                        (mod_code, prob)
-                                    })
-                                    .collect();
-                                let Ok(can_base) =
-                                    DnaBase::try_from(codes[0].canonical_base)
+                                let Ok((can_base, call, pos_mod_strand)) =
+                                    convert_mod_calls(
+                                        &calls_buf,
+                                        &mut probs_buf,
+                                        reverse,
+                                        &self.caller,
+                                        prob_stats.then_some(&mut cur_probs),
+                                    )
                                 else {
                                     erred_records =
                                         erred_records.saturating_add(1);
                                     continue 'records;
                                 };
-                                let Ok(mod_tag_strand) =
-                                    Strand::try_from(codes[0].strand)
-                                else {
-                                    erred_records =
-                                        erred_records.saturating_add(1);
-                                    continue 'records;
-                                };
-                                let can_base = match mod_tag_strand {
-                                    Strand::Positive => can_base,
-                                    Strand::Negative => can_base.complement(),
-                                };
-                                let Ok(pos_mod_strand) = duplex_aware_strand(
-                                    mod_tag_strand,
-                                    reverse,
-                                ) else {
-                                    erred_records =
-                                        erred_records.saturating_add(1);
-                                    continue 'records;
-                                };
-                                let bmp = BaseModProbs::new(probs, false);
-                                let call = self.caller.call(&can_base, &bmp);
 
                                 if q == pos {
                                     add_to_tally(
@@ -2680,9 +2655,43 @@ fn duplex_aware_strand(tag_strand: Strand, reverse: bool) -> MkResult<Strand> {
     }
 }
 
+/// Converts the calls at one position into the canonical base, the call,
+/// and the strand of the call, as done previously for htslib's
+/// `hts_base_mod`s: the canonical base and strand come from the first call,
+/// the call is made from all of the probabilities.
 #[inline]
-fn update_mods_iter2<'a>(
-    modbase_iter: &mut BaseModificationsPositionIter<'a>,
+fn convert_mod_calls(
+    calls: &[ModCall],
+    probs_buf: &mut Vec<(ModCodeRepr, f32)>,
+    reverse: bool,
+    caller: &MultipleThresholdModCaller,
+    probs_out: Option<&mut Vec<(ModCodeRepr, f32)>>,
+) -> MkResult<(DnaBase, BaseModCall, Strand)> {
+    probs_buf.clear();
+    probs_buf
+        .extend(calls.iter().map(|c| (c.mod_code, qual_to_prob(c.qual))));
+    if let Some(probs_out) = probs_out {
+        probs_out.clear();
+        probs_out.extend_from_slice(probs_buf);
+    }
+    let Ok(can_base) = DnaBase::try_from(calls[0].canonical_base) else {
+        return Err(MkError::InvalidMm("invalid DNA base".to_string()));
+    };
+    let tag_mod_strand = Strand::try_from(calls[0].strand)?;
+    let can_base = match tag_mod_strand {
+        Strand::Positive => can_base,
+        Strand::Negative => can_base.complement(),
+    };
+    let call = caller.call_from_probs(&can_base, probs_buf);
+    let strand = duplex_aware_strand(tag_mod_strand, reverse)?;
+    Ok((can_base, call, strand))
+}
+
+#[inline]
+fn update_mods_iter2(
+    modbase_iter: &mut ModCallsIter,
+    calls_buf: &mut Vec<ModCall>,
+    probs_buf: &mut Vec<(ModCodeRepr, f32)>,
     mod_pos: &mut Option<usize>,
     canonical_base: &mut Option<DnaBase>,
     pos_base_mod_call: &mut Option<BaseModCall>,
@@ -2691,52 +2700,15 @@ fn update_mods_iter2<'a>(
     caller: &MultipleThresholdModCaller,
     probs_out: Option<&mut Vec<(ModCodeRepr, f32)>>,
 ) -> MkResult<()> {
-    if let Some(res) = modbase_iter.next() {
-        match res {
-            Ok((pos, codes)) => {
-                if let Some(probs_out) = probs_out {
-                    probs_out.clear();
-                    probs_out.extend(codes.iter().map(|hts_code| {
-                        (
-                            ModCodeRepr::from(hts_code.modified_base),
-                            qual_to_prob(hts_code.qual),
-                        )
-                    }));
-                }
-                let pos = pos as usize;
-                let Ok(can_base) = DnaBase::try_from(codes[0].canonical_base)
-                else {
-                    return Err(MkError::InvalidMm(
-                        "invalid DNA base".to_string(),
-                    ));
-                };
-                let tag_mod_strand = Strand::try_from(codes[0].strand)?;
-                let can_base = match tag_mod_strand {
-                    Strand::Positive => can_base,
-                    Strand::Negative => can_base.complement(),
-                };
-                let base_mod_probs = codes
-                    .iter()
-                    .map(|hts_code| {
-                        (
-                            ModCodeRepr::from(hts_code.modified_base),
-                            qual_to_prob(hts_code.qual),
-                        )
-                    })
-                    .collect();
-                let base_mod_probs = BaseModProbs::new(base_mod_probs, false);
-
-                *pos_base_mod_call =
-                    Some(caller.call(&can_base, &base_mod_probs));
-                *mod_pos = Some(pos);
-                *canonical_base = Some(can_base);
-                let strand = duplex_aware_strand(tag_mod_strand, reverse)?;
-                *mod_strand = Some(strand)
-            }
-            Err(e) => {
-                return Err(MkError::HtsLibError(e));
-            }
-        }
+    // when there are no further calls, the previous state is kept
+    if let Some(res) = modbase_iter.next_into(calls_buf) {
+        let pos = res?;
+        let (can_base, call, strand) =
+            convert_mod_calls(calls_buf, probs_buf, reverse, caller, probs_out)?;
+        *pos_base_mod_call = Some(call);
+        *mod_pos = Some(pos);
+        *canonical_base = Some(can_base);
+        *mod_strand = Some(strand)
     }
     Ok(())
 }
