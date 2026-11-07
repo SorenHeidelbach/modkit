@@ -1,3 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["modkit", "modkit-core", "modkit-logging"]
+
+[profile.release]
+# whole-program optimization: lets small functions from other crates (e.g.
+# rust-htslib) be inlined into the pileup hot loops
+lto = "fat"
+codegen-units = 1
