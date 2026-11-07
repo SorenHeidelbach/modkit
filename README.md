@@ -2,6 +2,14 @@
 
 # Modkit
 
+> [!NOTE]
+> This fork is a speed-focused, `pileup`-only build of modkit v0.6.4. All other
+> subcommands (and the `ochm` crate) have been removed. `modkit pileup`
+> produces the same output as v0.6.4, typically 1.5-4x faster with much lower
+> memory use. It additionally supports `--prob-stats` (see
+> `book/src/intro_pileup.md`). Build with `cargo install --path modkit`. The
+> rest of this README describes upstream modkit.
+
 A bioinformatics tool for working with modified bases from Oxford Nanopore.
 Specifically for quickly converting modBAM to bedMethyl files using best practices, but also manipulating modBAM files and generating summary statistics.
 Detailed documentation and quick-start can be found in the [online documentation](https://nanoporetech.github.io/modkit/).

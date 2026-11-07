@@ -8,7 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Adds
   - [pileup] Adds `--prob-stats` to append per-position base modification probability statistics (`n_prob`, `mean_prob`, `sd_prob`, `q25_prob`, `median_prob`, `q75_prob`, `mean_confidence`) to the bedMethyl output. The standard 18 columns are unchanged.
 ### Changes
-  - [pileup] Faster pileup with lower memory use, especially without `--modified-bases` (about 3x faster on the default path). Output is unchanged.
+  - Removed every subcommand except `pileup` (and the `ochm` crate), this is a pileup-only build.
+  - [pileup] Faster pileup with lower memory use, output is unchanged: dense tally tables, rows formatted on the worker threads, an allocation-free MM/ML parser and modification calls (htslib is used for anything outside the simple subset), libdeflate, and LTO. 1.5-4x faster than v0.6.4 on the benchmarks.
 
 ## [v0.6.4]
 ### Adds

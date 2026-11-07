@@ -1,41 +1,21 @@
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{stdout, BufWriter, Cursor, Stdout, Write};
+use std::io::{stdout, BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result as AnyhowResult};
+use anyhow::{anyhow, Context, Result as AnyhowResult};
 use bitvec::order::Lsb0;
 use bitvec::view::BitView;
-use charming::component::{
-    Axis, DataZoom, DataZoomType, Feature, Legend, Restore, SaveAsImage, Title,
-    Toolbox, ToolboxDataZoom,
-};
-use charming::element::{
-    AxisPointer, AxisPointerType, AxisType, Color, Tooltip, Trigger,
-};
-use charming::series::Bar;
-use charming::{Chart, HtmlRenderer};
 use crossbeam_channel::Sender;
-use derive_new::new;
 use gzp::deflate::Bgzf;
 use gzp::par::compress::{ParCompress, ParCompressBuilder};
 use indicatif::{MultiProgress, ProgressBar};
 use itertools::Itertools;
-use log::{debug, info, warn};
-use prettytable::format::FormatBuilder;
-use prettytable::{row, Table};
-use random_color::RandomColor;
 use rust_htslib::bam::HeaderView;
 
-use crate::mod_base_code::{
-    BaseState, DnaBase, ModCodeRepr, ModifiedBasesOptions, ProbHistogram,
-    DNA_BASE_COLORS, MOD_COLORS,
-};
+use crate::mod_base_code::ModifiedBasesOptions;
 use crate::pileup::bedrmod::BedRModArgs;
 use crate::pileup::prob_stats::{ProbStats, PROB_STATS_HEADER_FIELDS};
 use crate::pileup::{ModBasePileup2, PileupFeatureCounts2};
-use crate::sample_probs::PercentileThresholdQual;
 use crate::util::{get_ticker_with_rate, TAB};
 
 pub trait PileupWriter<T> {

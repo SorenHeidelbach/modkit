@@ -7,12 +7,11 @@ use log::{debug, info, warn};
 use rust_htslib::bam::{self, Header};
 
 use crate::fasta::MotifLocationsLookup;
-use crate::mod_bam::{prob_to_qual, CollapseMethod, EdgeFilter};
+use crate::mod_bam::{prob_to_qual, EdgeFilter};
 use crate::mod_base_code::{DnaBase, ModCodeRepr};
 use crate::motifs::motif_bed::RegexMotif;
-use crate::position_filter::StrandedPositionFilter;
 use crate::threshold_mod_caller::MultipleThresholdModCaller;
-use crate::util::{create_out_directory, Region};
+use crate::util::create_out_directory;
 
 pub fn parse_per_mod_thresholds(
     raw_per_mod_thresholds: &[String],

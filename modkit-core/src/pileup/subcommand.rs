@@ -1,13 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::bail;
 use clap::Args;
 use common_macros::hash_set;
-use crossbeam_channel::bounded;
-use indicatif::{MultiProgress, ParallelProgressIterator};
+use indicatif::MultiProgress;
 use itertools::Itertools;
 use log::{debug, error, info, warn};
 use rayon::prelude::*;
@@ -20,11 +18,10 @@ use crate::command_utils::{
     parse_per_base_thresholds, parse_per_mod_thresholds, parse_raw_motifs,
     parse_raw_thresholds_string_with_default, parse_thresholds_values,
 };
-use crate::fasta::MotifLocationsLookup;
 use crate::interval_chunks::{
-    ChromCoordinatesFeeder, ReferenceIntervalBatchesFeeder, TotalLength,
+    ChromCoordinatesFeeder, TotalLength,
 };
-use crate::mod_bam::{CollapseMethod, EdgeFilter};
+use crate::mod_bam::EdgeFilter;
 use crate::mod_base_code::{
     DnaBase, ModCodeRepr, ModifiedBasesOptions, ANY_ADENINE, ANY_CYTOSINE,
     ANY_GUANINE, ANY_THYMINE, METHYL_CYTOSINE, SIX_METHYL_ADENINE,
@@ -39,15 +36,14 @@ use crate::pileup::pileup_processor::{
 };
 use crate::pileup::{ModBasePileup2, PileupNumericOptions};
 use crate::position_filter::StrandedPositionFilter;
-use crate::reads_sampler::sampling_schedule::IdxStats;
 use crate::sample_probs::{
     calculate_reads_per_contig, run_extract_probs_workers,
     AlignedBaseArgmaxProbs, BaseArgmaxProbs, ExtractProbsWorker,
     ProbsExtractor, RegionMleProbs,
 };
 use crate::util::{
-    create_out_directory, filter_reference_records, get_master_progress_bar,
-    get_master_progress_bar_fancy, get_subroutine_progress_bar, get_targets,
+    create_out_directory, filter_reference_records,
+    get_master_progress_bar_fancy, get_targets,
     get_ticker, reader_is_bam, reader_is_cram, Region,
 };
 use crate::writers::{

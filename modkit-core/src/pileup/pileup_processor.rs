@@ -12,7 +12,7 @@ use crate::{
     errs::{MkError, MkResult},
     interval_chunks::{ChromCoordinates, FocusPositions2},
     mod_bam::{
-        validate_mn_tag_on_record, BaseModCall, BaseModProbs, EdgeFilter,
+        validate_mn_tag_on_record, BaseModCall, EdgeFilter,
         MmTagInfo,
     },
     mod_base_code::{
@@ -34,7 +34,7 @@ use crate::{
 };
 use rust_htslib::{
     bam::{
-        self, ext::BamRecordExtensions, record::BaseModificationsPositionIter,
+        self, ext::BamRecordExtensions,
         FetchDefinition, Read,
     },
     htslib::{self},
