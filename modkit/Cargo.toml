@@ -6,13 +6,11 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.68"
 clap = { version = "4.0.29", features = ["derive", "wrap_help"] }
-clap_complete_command = "0.6.1"
 indicatif = { version = "0.17.1", features = ["rayon"] }
 itertools = "0.12.1"
 log = "0.4.0"
 mod_kit = { path = "../modkit-core" }
 modkit-logging = { path = "../modkit-logging" }
-ochm = { path = "../ochm" }
 rayon = "1.8.0"
 rust-htslib = "0.46.0"
 rustc-hash = "1.1.0"

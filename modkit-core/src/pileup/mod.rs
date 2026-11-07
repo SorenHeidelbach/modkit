@@ -4,14 +4,12 @@ use derive_new::new;
 use log::debug;
 use rust_htslib::bam;
 
-use crate::dmr::bedmethyl::BedMethylLine;
 use crate::mod_bam::CollapseMethod;
 use crate::mod_base_code::{DnaBase, ModCodeRepr};
 use crate::util::StrandRule;
 
 pub(crate) mod base_mods_adapter;
 pub(crate) mod bedrmod;
-pub(crate) mod duplex;
 pub(super) mod pileup_processor;
 pub(crate) mod prob_stats;
 pub mod subcommand;
@@ -70,24 +68,6 @@ pub struct PileupFeatureCounts {
     pub motif_idx: Option<usize>,
 }
 
-impl From<BedMethylLine> for PileupFeatureCounts {
-    fn from(item: BedMethylLine) -> PileupFeatureCounts {
-        PileupFeatureCounts::new(
-            item.strand.into(),
-            item.valid_coverage.try_into().unwrap_or(0),
-            item.raw_mod_code,
-            item.frac_modified(),
-            item.count_canonical.try_into().unwrap_or(0),
-            item.count_methylated.try_into().unwrap_or(0),
-            item.count_other.try_into().unwrap_or(0),
-            item.count_delete.try_into().unwrap_or(0),
-            item.count_fail.try_into().unwrap_or(0),
-            item.count_diff.try_into().unwrap_or(0),
-            item.count_nocall.try_into().unwrap_or(0),
-            None,
-        )
-    }
-}
 
 #[derive(new)]
 struct StrandPileup {

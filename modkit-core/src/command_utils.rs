@@ -6,14 +6,12 @@ use itertools::Itertools;
 use log::{debug, info, warn};
 use rust_htslib::bam::{self, Header};
 
-use crate::adjust::OverlappingRegexOffset;
 use crate::fasta::MotifLocationsLookup;
 use crate::mod_bam::{prob_to_qual, CollapseMethod, EdgeFilter};
 use crate::mod_base_code::{DnaBase, ModCodeRepr};
 use crate::motifs::motif_bed::RegexMotif;
 use crate::position_filter::StrandedPositionFilter;
 use crate::threshold_mod_caller::MultipleThresholdModCaller;
-use crate::thresholds::calc_threshold_from_bam;
 use crate::util::{create_out_directory, Region};
 
 pub fn parse_per_mod_thresholds(
@@ -122,68 +120,6 @@ pub fn parse_thresholds(
         per_base_thresholds,
         per_mod_thresholds.unwrap_or_else(HashMap::new),
         default.unwrap_or(0f32),
-    ))
-}
-
-pub fn get_threshold_from_options(
-    in_bam: &PathBuf,
-    threads: usize,
-    interval_size: u32,
-    sample_frac: Option<f64>,
-    num_reads: usize,
-    no_filtering: bool,
-    filter_percentile: f32,
-    seed: Option<u64>,
-    region: Option<&Region>,
-    per_mod_thresholds: Option<HashMap<ModCodeRepr, f32>>,
-    edge_filter: Option<&EdgeFilter>,
-    collapse_method: Option<&CollapseMethod>,
-    position_filter: Option<&StrandedPositionFilter<()>>,
-    only_mapped: bool,
-    suppress_progress: bool,
-) -> anyhow::Result<MultipleThresholdModCaller> {
-    if no_filtering {
-        info!("not performing filtering");
-        return Ok(MultipleThresholdModCaller::new_passthrough());
-    }
-    let (sample_frac, num_reads) = match sample_frac {
-        Some(f) => {
-            let pct = f * 100f64;
-            info!("sampling {pct}% of reads");
-            (Some(f), None)
-        }
-        None => {
-            info!("attempting to sample {num_reads} reads");
-            (None, Some(num_reads))
-        }
-    };
-    let per_base_thresholds = calc_threshold_from_bam(
-        in_bam,
-        threads,
-        interval_size,
-        sample_frac,
-        num_reads,
-        filter_percentile,
-        seed,
-        region,
-        edge_filter,
-        collapse_method,
-        position_filter,
-        only_mapped,
-        suppress_progress,
-    )?;
-
-    for (dna_base, threshold) in per_base_thresholds.iter() {
-        debug!(
-            "estimated pass threshold {threshold} for primary sequence base {}",
-            dna_base.char()
-        );
-    }
-
-    Ok(MultipleThresholdModCaller::new(
-        per_base_thresholds,
-        per_mod_thresholds.unwrap_or(HashMap::new()),
-        0f32,
     ))
 }
 
@@ -360,37 +296,6 @@ pub(crate) fn calculate_chunk_size(
             cs * interval_size as usize
         );
         cs
-    }
-}
-
-pub fn parse_forward_motifs(
-    input_motifs: &Option<Vec<String>>,
-    cpg: bool,
-) -> anyhow::Result<Option<Vec<OverlappingRegexOffset>>> {
-    match (input_motifs.as_ref(), cpg) {
-        (Some(raw_motifs), _) => {
-            let motifs = RegexMotif::from_raw_parts(&raw_motifs, cpg)?;
-            let motifs = motifs
-                .into_iter()
-                .map(|mot| {
-                    let offset = mot.forward_offset();
-                    OverlappingRegexOffset::new(mot.forward_pattern, offset)
-                })
-                .collect::<Vec<OverlappingRegexOffset>>();
-            Ok(Some(motifs))
-        }
-        (None, true) => {
-            let motifs = RegexMotif::from_raw_parts(&[], true).unwrap();
-            let motifs = motifs
-                .into_iter()
-                .map(|mot| {
-                    let offset = mot.forward_offset();
-                    OverlappingRegexOffset::new(mot.forward_pattern, offset)
-                })
-                .collect::<Vec<OverlappingRegexOffset>>();
-            Ok(Some(motifs))
-        }
-        (None, false) => Ok(None),
     }
 }
 

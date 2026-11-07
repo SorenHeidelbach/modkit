@@ -26,7 +26,6 @@ use crate::{
     },
     mod_bam::{prob_to_qual, validate_mn_tag_on_record, EdgeFilter},
     mod_base_code::ModCodeRepr,
-    modbam_util::subcommands::SampleModBaseProbs,
     motifs::motif_bed::RegexMotif,
     pileup::base_mods_adapter::{
         AlignedBaseModsIterator, BaseModsAdapter, ModState,
@@ -1703,7 +1702,7 @@ pub(crate) fn calculate_reads_per_contig(
             multi_progress.suspend(|| {
                 info!("attempting to sample at least {num_reads} reads");
             });
-            let counts = SampleModBaseProbs::calc_counts_per_chrom(
+            let counts = calc_counts_per_chrom(
                 interval_size,
                 bam_header,
                 num_reads,
@@ -1758,4 +1757,62 @@ fn byte_to_bool_positions<const SIZE: usize>(b: u8, agg: &mut [u32; SIZE]) {
         let count = agg[i];
         agg[i] = count.saturating_add(1u32);
     }
+}
+
+/// Number of reads to sample per interval for each contig (moved from the
+/// former `sample-probs` subcommand).
+fn calc_counts_per_chrom(
+    interval_size: u32,
+    header: &HeaderView,
+    num_reads: usize,
+    region: Option<&Region>,
+) -> anyhow::Result<FxHashMap<u32, usize>> {
+    let total_reference_length = if let Some(region) = region {
+        header
+            .tid(region.name.as_bytes())
+            .and_then(|tid| header.target_len(tid))
+            .ok_or(anyhow!("didn't find {region} in header"))?
+    } else {
+        (0..header.target_count())
+            .map(|tid| header.target_len(tid).unwrap_or(0))
+            .sum::<u64>()
+    };
+    let out = (0..header.target_count())
+        .filter(|tid| {
+            region
+                .map(|region| {
+                    header.tid2name(*tid) == region.name.as_bytes()
+                })
+                .unwrap_or(true)
+        })
+        .filter_map(|tid| header.target_len(tid).map(|l| (tid, l)))
+        .map(|(tid, l)| {
+            let frac = l as f64 / total_reference_length as f64;
+            // debug!("tid {tid} is {frac} of the total length");
+            let n_reads_for_chrom = frac * num_reads as f64;
+            // debug!("sampling {n_reads_for_chrom} reads from {tid}");
+            let frac_of_chrom_per_interval = if interval_size as u64 > l {
+                1f64
+            } else {
+                interval_size as f64 / l as f64
+            };
+            // debug!(
+            //     "each {interval_size} bp interval is \
+            //      {frac_of_chrom_per_interval:.3} fraction of {tid} which
+            // \      has lengh {l}"
+            // );
+            let n_reads_per_interval =
+                frac_of_chrom_per_interval * n_reads_for_chrom;
+            let fudge_factor = n_reads_per_interval * 0.25;
+            let total_reads_per_interval =
+                (n_reads_per_interval + fudge_factor).ceil() as usize;
+            // debug!(
+            //     "sampling {total_reads_per_interval} total reads per \
+            //      interval from {tid} with fudge factor of {fudge_factor}
+            // \      ({n_reads_per_interval} calculated)"
+            // );
+            (tid, total_reads_per_interval)
+        })
+        .collect();
+    Ok(out)
 }

@@ -11,9 +11,7 @@ edition = "2021"
 path = "src/lib.rs"
 
 [dependencies]
-ansi_term = "0.12.1"
 anyhow = "1.0.68"
-bigtools = "0.5.6"
 bio = "1.0.0"
 bitvec = "1.0.1"
 charming = "0.3.1"
@@ -21,10 +19,8 @@ clap = { version = "4.0.29", features = ["derive", "wrap_help"] }
 common_macros = "0.1.1"
 crossbeam = "0.8.2"
 crossbeam-channel = "0.5.6"
-csv = "1.3.0"
 derive-new = "0.6.0"
 gzp = { version = "0.11.3", default-features = false, features = ["deflate_rust"] }
-humantime = "2.1.0"
 indexmap = "2.2.6"
 indicatif = { version = "0.17.1", features = ["rayon"] }
 itertools = "0.12.1"
@@ -33,9 +29,7 @@ linear-map = "1.2.0"
 log = "0.4.0"
 log-once = "0.4.0"
 memchr = "2.6.4"
-ndarray = "0.15.6"
 nom = "7.1.3"
-num = "0.4.3"
 num-traits = "0.2.19"
 prettytable-rs = "0.10.0"
 pulp = "0.18.10"
@@ -47,14 +41,10 @@ rust-htslib = "0.46.0"
 rust-lapper = "1.1.0"
 rustc-hash = "1.1.0"
 rv = "=0.16.0"
-statrs = "0.16.0"
 substring = "1.4.5"
 thiserror = "2.0.11"
-tokio = "1.42.0"
 tracing = "0.1.41"
 modkit-logging = { path = "../modkit-logging" }
-safe-record = { path = "../safe-record" }
-serde_json = "1.0.149"
 
 [dev-dependencies]
 assert_approx_eq = "1.1.0"

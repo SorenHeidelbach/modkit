@@ -1,43 +1,25 @@
 extern crate core;
 
-pub mod adjust;
-pub mod bedmethyl_util;
 // pub mod commands;
 pub mod command_utils;
-pub mod dmr;
-pub mod entropy;
 pub mod errs;
-pub mod extract;
 pub mod interval_chunks;
-pub mod localise;
 // pub mod logging;
 pub mod mod_bam;
 pub mod mod_base_code;
-pub mod modbam_util;
 pub mod monoid;
 pub mod motifs;
 pub mod pileup;
 pub mod position_filter;
-pub mod read_ids_to_base_mod_probs;
 pub mod reads_sampler;
-pub mod record_processor;
-pub mod repair_tags;
-pub mod stats;
-pub mod summarize;
 pub mod threshold_mod_caller;
-pub mod thresholds;
 pub mod util;
-pub mod validate;
 pub mod writers;
 
-pub(crate) mod genome_positions;
 pub(crate) mod parsing_utils;
 pub(crate) mod sample_probs;
 
 mod fasta;
-mod hmm;
-mod read_cache;
-mod tabix;
 
 #[cfg(test)]
 pub mod test_utils {
