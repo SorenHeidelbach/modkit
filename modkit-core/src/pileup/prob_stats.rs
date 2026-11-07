@@ -108,6 +108,38 @@ impl ProbStats {
     }
 }
 
+impl ProbStats {
+    /// Appends the extra columns, each preceded by a tab, same text as
+    /// `write_columns`.
+    #[inline]
+    pub(crate) fn push_columns(&self, buf: &mut Vec<u8>) {
+        use crate::pileup::format::{push_fixed, push_uint};
+        if self.n == 0 {
+            buf.extend_from_slice(b"\t0\t.\t.\t.\t.\t.\t.");
+            return;
+        }
+        buf.push(b'\t');
+        push_uint(buf, self.n as u64);
+        for v in [
+            self.mean,
+            self.sd,
+            self.q25,
+            self.median,
+            self.q75,
+            self.mean_confidence,
+        ] {
+            buf.push(b'\t');
+            push_fixed::<4>(buf, v);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_values_for_test(values: &mut [f32]) -> Self {
+        let confidences = values.iter().map(|x| x.max(1f32 - x)).collect::<Vec<_>>();
+        Self::from_values(values, &confidences)
+    }
+}
+
 /// Writes a finite, non-negative `f32` with 4 decimal places, producing the
 /// same text as `format!("{:.4}", v)`. Any `f32` multiplied by 10^4 is exact
 /// in an `f64` (24 + 14 bits of mantissa), so rounding the product with ties

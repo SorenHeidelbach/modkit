@@ -191,6 +191,12 @@ impl<T: Write> PileupWriter<ModBasePileup2> for BedMethylWriter2<T> {
         item: ModBasePileup2,
         _motif_labels: &[String],
     ) -> anyhow::Result<u64> {
+        if item.preformatted {
+            self.inner.write(&item.formatted)?;
+            let n_rows = item.formatted_rows;
+            let _ = self.return_mem.send(item);
+            return Ok(n_rows);
+        }
         self.buff.set_position(0);
         let n_rows = item.position_feature_counts.len() as u64;
         let chrom_name = &item.chrom_name;
@@ -397,6 +403,12 @@ impl<T: Write> PileupWriter<ModBasePileup2>
         item: ModBasePileup2,
         motif_labels: &[String],
     ) -> anyhow::Result<u64> {
+        if item.preformatted {
+            self.writer.write(&item.formatted)?;
+            let n_rows = item.formatted_rows;
+            let _ = self.return_mem.send(item);
+            return Ok(n_rows);
+        }
         let mut rows_written = 0u64;
         let chrom_name = &item.chrom_name;
         let mut buff = Cursor::new([0u8; 1024]);

@@ -31,6 +31,7 @@ use crate::mod_base_code::{
 };
 use crate::motifs::motif_bed::{MotifInfo, RegexMotif};
 use crate::pileup::bedrmod::BedRModArgs;
+use crate::pileup::format::RowFormatter;
 use crate::pileup::pileup_processor::{
     CountsMatrix, DnaAllContext, DnaCpGCombineStrands, DnaCytosineCombine,
     DnaModOption, DnaPileupWorker, Dynamic, GenericPileupWorker, PileupWorker,
@@ -1067,6 +1068,11 @@ impl ModBamPileup {
 
         // setup the writer here so we fail before doing any work (if there are
         // problems).
+        // whether the multiple-motif writer is used (see below), needed again
+        // to set up the worker-side row formatting
+        let use_multiple_motif_writer = !self.phased
+            && regex_motifs.as_ref().map(|x| x.len() > 1).unwrap_or(false)
+            && preset.is_none();
         let mut writer: Box<dyn PileupWriter<ModBasePileup2>> = if self.phased {
             let out_dir = Path::new(&self.out_bed);
             if out_dir.exists() && !out_dir.is_dir() {
@@ -1612,13 +1618,31 @@ impl ModBamPileup {
             }
         });
 
+        // Format rows on the worker threads (in parallel) for the writers
+        // that support it. Must mirror the writer selection above.
+        let row_formatter = if self.phased {
+            None
+        } else {
+            Some(std::sync::Arc::new(RowFormatter {
+                bedrmod_spec: self.bedrmodargs.enabled(),
+                motif_labels: use_multiple_motif_writer
+                    .then(|| motif_labels.clone()),
+            }))
+        };
+
         let mut handles = Vec::with_capacity(workers.len());
         for mut worker_state in workers {
             let jobs_rx = jobs_rx.clone();
             let results_tx = results_tx.clone();
+            let row_formatter = row_formatter.clone();
             handles.push(std::thread::spawn(move || {
                 while let Ok((seq, item, mem)) = jobs_rx.recv() {
-                    let out = worker_state.process(item, mem);
+                    let out = worker_state.process(item, mem).map(|mut out| {
+                        if let Some(formatter) = row_formatter.as_ref() {
+                            formatter.format_into(&mut out);
+                        }
+                        out
+                    });
                     // If collector disappeared, we can exit.
                     if results_tx.send((seq, out)).is_err() {
                         break;

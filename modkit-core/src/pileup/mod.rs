@@ -11,6 +11,7 @@ use crate::util::StrandRule;
 pub(crate) mod base_mods_adapter;
 pub(crate) mod bedrmod;
 pub(super) mod pileup_processor;
+pub(crate) mod format;
 pub(crate) mod prob_stats;
 pub mod subcommand;
 
@@ -156,10 +157,15 @@ pub struct ModBasePileup2 {
     /// Probability statistics aligned with `position_feature_counts`, only
     /// populated with `--prob-stats`.
     pub(crate) prob_stats: Vec<prob_stats::ProbStats>,
+    /// Rows formatted as bedMethyl text by the worker thread, see
+    /// `format::RowFormatter`. Only valid when `preformatted` is set.
+    pub(crate) formatted: Vec<u8>,
+    pub(crate) formatted_rows: u64,
+    pub(crate) preformatted: bool,
 }
 
 impl ModBasePileup2 {
-    fn new_empty() -> Self {
+    pub(crate) fn new_empty() -> Self {
         Self {
             chrom_name: "EMPTY".to_string(),
             position_feature_counts: Vec::new(),
@@ -168,6 +174,9 @@ impl ModBasePileup2 {
             failed_records: 0,
             phased_feature_counts: [Vec::new(), Vec::new()],
             prob_stats: Vec::new(),
+            formatted: Vec::new(),
+            formatted_rows: 0,
+            preformatted: false,
         }
     }
 }
