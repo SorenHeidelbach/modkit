@@ -16,12 +16,33 @@ use crate::motifs::motif_bed::{find_motif_hits, MotifInfo, RegexMotif};
 use crate::position_filter::StrandedPositionFilter;
 use crate::util::Strand;
 
-#[derive(Clone)]
+/// An htslib FASTA reader that can be moved to another thread. `faidx_t`
+/// has no thread affinity, it just must not be used from two threads at
+/// once, which holds since this is not `Sync`.
+struct SendFaidx(faidx::Reader);
+unsafe impl Send for SendFaidx {}
+
 struct HtsFastaHandle {
     fasta_fp: PathBuf,
     contigs: FxHashMap<String, u64>,
     preloaded: bool,
     sequences: FxHashMap<String, String>,
+    /// Opened once on first use: loading the index for every fetch is
+    /// quadratic in the number of contigs.
+    reader: std::cell::OnceCell<SendFaidx>,
+}
+
+impl Clone for HtsFastaHandle {
+    fn clone(&self) -> Self {
+        Self {
+            fasta_fp: self.fasta_fp.clone(),
+            contigs: self.contigs.clone(),
+            preloaded: self.preloaded,
+            sequences: self.sequences.clone(),
+            // each clone opens its own reader
+            reader: std::cell::OnceCell::new(),
+        }
+    }
 }
 
 impl HtsFastaHandle {
@@ -66,6 +87,7 @@ impl HtsFastaHandle {
             contigs,
             sequences,
             preloaded: preload,
+            reader: std::cell::OnceCell::new(),
         })
     }
 
@@ -85,9 +107,18 @@ impl HtsFastaHandle {
                     let s = self.sequences.get(contig).unwrap();
                     s.substring(start as usize, end as usize).to_string()
                 } else {
-                    let tmp_reader = faidx::Reader::from_path(&self.fasta_fp)
-                        .map_err(|e| MkError::HtsLibError(e))?;
-                    tmp_reader
+                    let reader = match self.reader.get() {
+                        Some(reader) => reader,
+                        None => {
+                            let reader =
+                                faidx::Reader::from_path(&self.fasta_fp)
+                                    .map_err(|e| MkError::HtsLibError(e))?;
+                            let _ = self.reader.set(SendFaidx(reader));
+                            self.reader.get().unwrap()
+                        }
+                    };
+                    reader
+                        .0
                         .fetch_seq_string(contig, start as usize, end as usize)
                         .map_err(|e| MkError::HtsLibError(e))?
                 };
