@@ -536,10 +536,9 @@ impl<
             pileup_space.chrom_name = chrom_name;
             pileup_space.interval_width = width;
             pileup_space.stride = self.matrix.stride(self.dna_mod_option);
-            pileup_space.position_feature_counts = position_feature_counts
-                .into_iter()
-                .filter(|x| x.is_valid())
-                .collect();
+            let mut position_feature_counts = position_feature_counts;
+            position_feature_counts.retain(|x| x.is_valid());
+            pileup_space.position_feature_counts = position_feature_counts;
             if self.prob_stats {
                 self.prob_acc.stats_for_rows(
                     start_pos,
@@ -1259,6 +1258,19 @@ pub(super) trait ACountsMatrix<T, const STRANDS: usize, const CHECK_DEPTH: bool>
         mod_code_op: DnaModOption,
         phased: bool,
     ) -> Vec<PileupFeatureCounts2> {
+        if !phased {
+            // a single block, avoid collecting it a second time
+            let pos_start = 0;
+            let pos_end = pos_start + self.strand_width();
+            let neg_start = pos_end;
+            let neg_end = neg_start + self.strand_width();
+            return self.decode_inner(
+                start_pos,
+                mod_code_op,
+                pos_start..pos_end,
+                neg_start..neg_end,
+            );
+        }
         let offsets = if phased { PHASED_OFFSETS } else { UNPHASED_OFFSET };
         offsets
             .iter()
@@ -2253,10 +2265,13 @@ fn slice_to_counts_dna_all_context(
                 chunk[NO_CALL_OFFSET],
                 0u8,
             );
-            vec![a_rec, third_mod_c_record, meth_c_record]
+            // no heap allocation per position
+            [Some(a_rec), Some(third_mod_c_record), Some(meth_c_record)]
         } else {
-            vec![a_rec, meth_c_record]
+            [Some(a_rec), None, Some(meth_c_record)]
         }
+        .into_iter()
+        .flatten()
     })
 }
 
