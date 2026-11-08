@@ -1201,37 +1201,68 @@ impl OutWriter<SampledProbs> for TsvWriter<BufWriter<Stdout>> {
 }
 
 #[inline]
+fn push_uint(buff: &mut Cursor<Vec<u8>>, mut value: u64, sep: u8) {
+    let mut tmp = [0u8; 21];
+    let mut i = tmp.len() - 1;
+    tmp[i] = sep;
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let _ = buff.write_all(&tmp[i..]);
+}
+
+#[inline]
+fn push_char(buff: &mut Cursor<Vec<u8>>, c: char, sep: u8) {
+    let mut tmp = [0u8; 5];
+    let n = c.encode_utf8(&mut tmp).len();
+    tmp[n] = sep;
+    let _ = buff.write_all(&tmp[..=n]);
+}
+
+#[inline]
 fn format_feature_counts2(
     chrom_name: &String,
     buff: &mut Cursor<Vec<u8>>,
     feature_count: &PileupFeatureCounts2,
     bedrmod_spec: bool,
 ) -> anyhow::Result<()> {
-    let pos = feature_count.position;
+    const T: u8 = b'\t';
+    let pos = feature_count.position as u64;
     let pp1 = pos + 1;
     let fraction_modified = feature_count.n_modified as f32
         / feature_count.filtered_coverage as f32;
-    write!(buff, "{}{TAB}", chrom_name)?;
-    write!(buff, "{pos}{TAB}{pp1}{TAB}")?;
-    write!(buff, "{}{TAB}", feature_count.mod_code)?;
-    write!(buff, "{}{TAB}", feature_count.filtered_coverage)?;
-    write!(buff, "{}{TAB}", feature_count.raw_strand)?;
-    write!(buff, "{pos}{TAB}{pp1}{TAB}")?;
-    write!(buff, "255,0,0{TAB}")?;
+    buff.write_all(chrom_name.as_bytes())?;
+    buff.write_all(b"\t")?;
+    push_uint(buff, pos, T);
+    push_uint(buff, pp1, T);
+    match feature_count.mod_code {
+        ModCodeRepr::Code(c) => push_char(buff, c, T),
+        ModCodeRepr::ChEbi(x) => push_uint(buff, x as u64, T),
+    }
+    push_uint(buff, feature_count.filtered_coverage as u64, T);
+    push_char(buff, feature_count.raw_strand, T);
+    push_uint(buff, pos, T);
+    push_uint(buff, pp1, T);
+    buff.write_all(b"255,0,0\t")?;
     let cov_val = if bedrmod_spec {
         feature_count.filtered_coverage + feature_count.n_filtered
     } else {
         feature_count.filtered_coverage
     };
-    write!(buff, "{}{TAB}", cov_val)?;
+    push_uint(buff, cov_val as u64, T);
     write!(buff, "{:.2}{TAB}", fraction_modified * 100f32)?;
-    write!(buff, "{}{TAB}", feature_count.n_modified)?;
-    write!(buff, "{}{TAB}", feature_count.n_canonical)?;
-    write!(buff, "{}{TAB}", feature_count.n_other_modified)?;
-    write!(buff, "{}{TAB}", feature_count.n_delete)?;
-    write!(buff, "{}{TAB}", feature_count.n_filtered)?;
-    write!(buff, "{}{TAB}", feature_count.n_diff)?;
-    write!(buff, "{}\n", feature_count.n_nocall)?;
+    push_uint(buff, feature_count.n_modified as u64, T);
+    push_uint(buff, feature_count.n_canonical as u64, T);
+    push_uint(buff, feature_count.n_other_modified as u64, T);
+    push_uint(buff, feature_count.n_delete as u64, T);
+    push_uint(buff, feature_count.n_filtered as u64, T);
+    push_uint(buff, feature_count.n_diff as u64, T);
+    push_uint(buff, feature_count.n_nocall as u64, b'\n');
     Ok(())
 }
 
