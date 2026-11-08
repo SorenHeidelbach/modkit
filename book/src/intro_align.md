@@ -46,3 +46,13 @@ All the usual `pileup` options work (`--cpg`, `--motif`, `--modified-bases`, `--
 The output is identical to running `modkit modbam align`, `samtools sort` and `samtools index`, and then `modkit pileup` on the sorted BAM, including the estimated filter threshold.
 The aligned records are kept in memory (sorted the same way as `samtools sort`), roughly 1.5 bytes per aligned base plus the MM/ML tags, so this suits bacterial genomes, metagenomes, targeted data and single chromosomes better than whole human genomes at high coverage.
 No aligned BAM is produced; run `modkit modbam align` if you also need one.
+
+## Building for speed
+
+If you build modkit yourself for one machine, compiling the embedded minimap2 for that CPU makes alignment about 4% faster with identical output (`-ffp-contract=off` keeps floating-point results unchanged):
+
+```bash
+CFLAGS="-O3 -march=native -ffp-contract=off" cargo build --release
+```
+
+The resulting binary may not run on other CPUs.
