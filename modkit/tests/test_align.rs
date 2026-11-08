@@ -203,3 +203,36 @@ fn test_align_no_unmapped() {
     .unwrap();
     assert!(read_records(&out_bam).is_empty());
 }
+
+/// `pileup --align` (align in-process, pile up from memory) must give the
+/// same bedMethyl as `pileup` on the equivalent aligned, sorted BAM.
+#[test]
+fn test_pileup_align_matches_bam_pileup() {
+    let out_dir = tempfile::tempdir().unwrap();
+    for extra_args in [
+        vec![],
+        vec!["--no-filtering"],
+        vec!["--cpg", "--modified-bases", "5mC", "5hmC", "--ref", REF],
+        vec!["--motif", "CG", "0", "--combine-strands", "--ref", REF],
+    ] {
+        let from_bam = out_dir.path().join("from_bam.bed");
+        let streamed = out_dir.path().join("streamed.bed");
+        let mut args =
+            vec!["pileup", EXPECTED_ALIGNED, from_bam.to_str().unwrap()];
+        args.extend(extra_args.iter());
+        run_modkit(&args).unwrap();
+        let mut args = vec![
+            "pileup",
+            "--align",
+            REF,
+            UNALIGNED,
+            streamed.to_str().unwrap(),
+        ];
+        args.extend(extra_args.iter());
+        run_modkit(&args).unwrap();
+        let expected = std::fs::read_to_string(&from_bam).unwrap();
+        let observed = std::fs::read_to_string(&streamed).unwrap();
+        assert!(!expected.is_empty(), "{extra_args:?}");
+        assert_eq!(observed, expected, "{extra_args:?}");
+    }
+}

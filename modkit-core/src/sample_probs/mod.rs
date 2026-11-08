@@ -13,11 +13,11 @@ use prettytable::row;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rust_htslib::{
     bam::{self, ext::BamRecordExtensions, FetchDefinition, HeaderView, Read},
-    htslib,
 };
 use rustc_hash::FxHashMap;
 use tracing::error;
 
+use crate::record_source::{RecordSourceSpec, RegionRecordSource};
 use crate::{
     command_utils::get_motif_lookup_from_parts,
     errs::MkResult,
@@ -39,7 +39,7 @@ use crate::{
 };
 use crate::{
     mod_base_code::DnaBase,
-    util::{qual_to_prob, reader_is_cram},
+    util::qual_to_prob,
 };
 
 #[derive(new, Debug)]
@@ -705,7 +705,7 @@ pub(crate) struct BaseArgmaxProbs {}
 pub(crate) struct BaseAndModArgmaxProbs {}
 
 pub(crate) struct RegionMleProbs<T, H> {
-    reader: bam::IndexedReader,
+    reader: Box<dyn RegionRecordSource>,
     allow_non_primary: bool,
     hist: H,
     t: PhantomData<T>,
@@ -725,25 +725,33 @@ impl<T: Send + Sync, H: ExtractsMleProbs<T>> RegionMleProbs<T, H> {
         sample_frac: f64,
         chrom_to_counts: Option<Arc<FxHashMap<u32, usize>>>,
     ) -> anyhow::Result<Self> {
-        let mut reader = bam::IndexedReader::from_path(bam_fp)?;
-        reader.set_thread_pool(&thread_pool)?;
-        if reader_is_cram(&reader) {
-            if let Some(reference_fp) = reference_fp {
-                reader.set_reference(reference_fp)?;
-                reader.set_cram_options(
-                    htslib::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS,
-                    htslib::sam_fields_SAM_FLAG
-                        | htslib::sam_fields_SAM_RNAME
-                        | htslib::sam_fields_SAM_POS
-                        | htslib::sam_fields_SAM_MAPQ
-                        | htslib::sam_fields_SAM_CIGAR
-                        | htslib::sam_fields_SAM_SEQ
-                        | htslib::sam_fields_SAM_AUX,
-                )?;
-            } else {
-                bail!("CRAM input requires reference")
-            }
-        };
+        Self::new_from_source(
+            &RecordSourceSpec::Hts(bam_fp.clone()),
+            reference_fp,
+            allow_non_primary,
+            motif_bases,
+            edge_filter,
+            Some(thread_pool),
+            worker_no,
+            sample,
+            sample_frac,
+            chrom_to_counts,
+        )
+    }
+
+    pub(crate) fn new_from_source(
+        source: &RecordSourceSpec,
+        reference_fp: Option<&PathBuf>,
+        allow_non_primary: bool,
+        motif_bases: [DnaBase; 4],
+        edge_filter: Option<&EdgeFilter>,
+        thread_pool: Option<&rust_htslib::tpool::ThreadPool>,
+        worker_no: u64,
+        sample: bool,
+        sample_frac: f64,
+        chrom_to_counts: Option<Arc<FxHashMap<u32, usize>>>,
+    ) -> anyhow::Result<Self> {
+        let reader = source.open(reference_fp, thread_pool)?;
         let hist =
             H::new(worker_no, sample, sample_frac, motif_bases, edge_filter);
         Ok(Self {
@@ -770,11 +778,7 @@ impl<T: Send + Sync, H: ExtractsMleProbs<T> + Send> ExtractProbsWorker
         mem.interval_length = item.len();
         // debug!("worker starting on {chrom_tid}:{start_pos}-{end_pos}");
 
-        self.reader.fetch(FetchDefinition::Region(
-            chrom_tid as i32,
-            start_pos as i64,
-            end_pos as i64,
-        ))?;
+        let records = self.reader.fetch_records(chrom_tid, start_pos, end_pos)?;
 
         let num_records =
             if let Some(chrom_to_counts) = self.chrom_to_counts.as_ref() {
@@ -783,7 +787,7 @@ impl<T: Send + Sync, H: ExtractsMleProbs<T> + Send> ExtractProbsWorker
                 None
             };
 
-        'records: for res in self.reader.records() {
+        'records: for res in records {
             if let Some(num_records) = num_records {
                 if mem.ok_records >= num_records {
                     // debug!(

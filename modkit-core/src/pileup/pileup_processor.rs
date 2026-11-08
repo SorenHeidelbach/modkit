@@ -2,7 +2,7 @@ use std::{
     collections::HashMap, marker::PhantomData, ops::Range, path::PathBuf,
 };
 
-use anyhow::{anyhow, bail};
+use anyhow::anyhow;
 use bitvec::slice::BitSlice;
 use common_macros::hash_map;
 use itertools::Itertools;
@@ -10,6 +10,7 @@ use std::ops::BitOrAssign;
 
 use crate::{
     errs::{MkError, MkResult},
+    record_source::{RecordSourceSpec, RegionRecordSource},
     interval_chunks::{ChromCoordinates, FocusPositions2},
     mod_bam::{
         validate_mn_tag_on_record, BaseModCall, BaseModProbs, EdgeFilter,
@@ -26,16 +27,12 @@ use crate::{
     },
     threshold_mod_caller::MultipleThresholdModCaller,
     util::{
-        get_haplotype_tag, qual_to_prob, reader_is_cram, record_is_not_primary,
+        get_haplotype_tag, qual_to_prob, record_is_not_primary,
         record_is_primary, SamTag, Strand,
     },
 };
-use rust_htslib::{
-    bam::{
-        self, ext::BamRecordExtensions, record::BaseModificationsPositionIter,
-        FetchDefinition, Read,
-    },
-    htslib::{self},
+use rust_htslib::bam::{
+    ext::BamRecordExtensions, record::BaseModificationsPositionIter,
 };
 
 pub trait PileupWorker
@@ -55,7 +52,7 @@ pub(super) struct DnaPileupWorker<
     const STRANDS: usize,
     const CHECK_DEPTH: bool,
 > {
-    reader: bam::IndexedReader,
+    reader: Box<dyn RegionRecordSource>,
     phased: bool,
     dna_mod_option: DnaModOption,
     combine_mods: bool,
@@ -77,7 +74,7 @@ impl<
     > DnaPileupWorker<T, M, STRANDS, CHECK_DEPTH>
 {
     pub(crate) fn new(
-        bam_fp: &PathBuf,
+        source: &RecordSourceSpec,
         reference_fp: &PathBuf,
         phased: bool,
         filter_thresholds: [f32; 4],
@@ -94,20 +91,7 @@ impl<
             DnaModOption::Combine => true,
             _ => false,
         };
-        let mut reader = bam::IndexedReader::from_path(bam_fp)?;
-        if reader_is_cram(&reader) {
-            reader.set_reference(reference_fp)?;
-            reader.set_cram_options(
-                htslib::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS,
-                htslib::sam_fields_SAM_FLAG
-                    | htslib::sam_fields_SAM_RNAME
-                    | htslib::sam_fields_SAM_POS
-                    | htslib::sam_fields_SAM_MAPQ
-                    | htslib::sam_fields_SAM_CIGAR
-                    | htslib::sam_fields_SAM_SEQ
-                    | htslib::sam_fields_SAM_AUX,
-            )?;
-        };
+        let reader = source.open(Some(reference_fp), None)?;
         let edge_filter_start =
             edge_filter.map(|ef| ef.edge_filter_start).unwrap_or(0usize);
         let edge_filter_end =
@@ -154,18 +138,11 @@ impl<
             as usize;
         self.matrix.reset(width, self.phased);
 
-        let chrom_name =
-            String::from_utf8_lossy(self.reader.header().tid2name(chrom_tid))
-                .to_string();
+        let chrom_name = self.reader.target_name(chrom_tid);
 
-        self.reader.fetch(FetchDefinition::Region(
-            chrom_tid as i32,
-            start_pos as i64,
-            end_pos as i64,
-        ))?;
         let records = self
             .reader
-            .records()
+            .fetch_records(chrom_tid, start_pos, end_pos)?
             .filter_ok(|record| record.tid() >= 0i32)
             .filter_ok(|record| {
                 let read_length = record.seq_len();
@@ -483,7 +460,7 @@ pub(crate) enum DnaModOption {
 }
 
 pub struct GenericPileupWorker {
-    reader: bam::IndexedReader,
+    reader: Box<dyn RegionRecordSource>,
     motif_bases: Vec<MotifInfo>,
     caller: MultipleThresholdModCaller,
     pileup_numeric_options: PileupNumericOptions,
@@ -494,7 +471,7 @@ pub struct GenericPileupWorker {
 
 impl GenericPileupWorker {
     pub(crate) fn new(
-        in_bam_fp: &PathBuf,
+        source: &RecordSourceSpec,
         reference_fp: Option<&PathBuf>,
         motif_bases: Vec<MotifInfo>,
         default_threshold: f32,
@@ -504,24 +481,7 @@ impl GenericPileupWorker {
         combine_strands: bool,
         max_depth: u16,
     ) -> anyhow::Result<Self> {
-        let mut reader = bam::IndexedReader::from_path(in_bam_fp)?;
-        if reader_is_cram(&reader) {
-            if let Some(reference_fp) = reference_fp {
-                reader.set_reference(reference_fp)?;
-                reader.set_cram_options(
-                    htslib::hts_fmt_option_CRAM_OPT_REQUIRED_FIELDS,
-                    htslib::sam_fields_SAM_FLAG
-                        | htslib::sam_fields_SAM_RNAME
-                        | htslib::sam_fields_SAM_POS
-                        | htslib::sam_fields_SAM_MAPQ
-                        | htslib::sam_fields_SAM_CIGAR
-                        | htslib::sam_fields_SAM_SEQ
-                        | htslib::sam_fields_SAM_AUX,
-                )?;
-            } else {
-                bail!("CRAM input requires reference")
-            }
-        };
+        let reader = source.open(reference_fp, None)?;
 
         let per_base_thresholds = hash_map! {
             DnaBase::A => base_thresholds[DnaBase::A as usize],
@@ -565,18 +525,11 @@ impl PileupWorker for GenericPileupWorker {
             .ok_or_else(|| anyhow!("interval end before start"))?
             as usize;
 
-        let chrom_name =
-            String::from_utf8_lossy(self.reader.header().tid2name(chrom_tid))
-                .to_string();
+        let chrom_name = self.reader.target_name(chrom_tid);
 
-        self.reader.fetch(FetchDefinition::Region(
-            chrom_tid as i32,
-            start_pos as i64,
-            end_pos as i64,
-        ))?;
         let records = self
             .reader
-            .records()
+            .fetch_records(chrom_tid, start_pos, end_pos)?
             .filter_ok(|record| record.tid() >= 0i32)
             .filter_ok(|record| record_is_primary(record))
             // TODO: Capture errors here. Also check for partition-tag

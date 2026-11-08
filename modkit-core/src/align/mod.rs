@@ -36,6 +36,7 @@ use modkit_logging::init_logging;
 use safe_record::SafeRecord;
 
 use crate::command_utils::{get_bam_writer, get_serial_reader};
+use crate::record_source::{AlignedRecordStore, AlignedRecordStoreBuilder};
 use crate::util::{add_modkit_pg_records, get_ticker};
 
 /// Tags that describe an alignment, these are removed from the input record
@@ -201,213 +202,281 @@ impl AlignModBam {
                 .set_compression_level(bam::CompressionLevel::Uncompressed)?;
         }
 
-        let counts = Counts::default();
-        let ticker = get_ticker();
-        ticker.set_message("reads aligned");
-
         let settings = MapSettings {
             secondary: self.secondary,
             unmapped: !self.no_unmapped,
             md: self.md,
+            mod_tags_only: false,
         };
+        let mut write = |record: bam::Record| -> anyhow::Result<()> {
+            writer.write(&record).context("failed to write output record")
+        };
+        let counts = run_alignment(
+            reader,
+            &aligner,
+            &settings,
+            self.threads,
+            self.batch_size,
+            &mut write,
+        )?;
+        counts.log(self.no_unmapped);
+        Ok(())
+    }
+}
 
-        // Pipeline: reader -> workers -> (re-ordering) writer. Work is sent
-        // in small chunks so that a few long reads don't leave the other
-        // workers idle. The number of chunks in flight (being aligned or
-        // waiting to be written in order) is limited by a pool of tokens,
-        // which bounds memory use.
-        let max_in_flight = self.threads * 8;
-        let (token_snd, token_rcv) = bounded::<()>(max_in_flight);
-        for _ in 0..max_in_flight {
-            token_snd.send(()).expect("token channel should be open");
-        }
-        let (work_snd, work_rcv) =
-            bounded::<(usize, Vec<SafeRecord>)>(max_in_flight);
-        let (done_snd, done_rcv) =
-            bounded::<(usize, Vec<SafeRecord>)>(max_in_flight);
-
-        std::thread::scope(|scope| -> anyhow::Result<()> {
-            let counts = &counts;
-            let chunk_size = self.batch_size;
-            let reader_handle = scope.spawn(move || -> anyhow::Result<()> {
-                let mut chunk = Vec::with_capacity(chunk_size);
-                let mut chunk_idx = 0usize;
-                let mut send = |chunk: Vec<SafeRecord>| -> bool {
-                    // a closed channel means downstream stopped due to an
-                    // error, that error is reported by the writer.
-                    if token_rcv.recv().is_err() {
-                        return false;
-                    }
-                    let ok = work_snd.send((chunk_idx, chunk)).is_ok();
-                    chunk_idx += 1;
-                    ok
-                };
-                let mut record = bam::Record::new();
-                while let Some(res) = reader.read(&mut record) {
-                    res.context("failed to read input record")?;
-                    counts.reads_in.fetch_add(1, Ordering::Relaxed);
-                    match make_template(&record) {
-                        Ok(template) => chunk.push(SafeRecord::from(template)),
-                        Err(skip) => {
-                            let counter = match skip {
-                                Skip::SecondaryOrSupplementary => {
-                                    &counts.skipped_secondary_supplementary
-                                }
-                                Skip::NoSequence => &counts.skipped_no_seq,
-                                Skip::HardClipped => {
-                                    &counts.skipped_hard_clipped
-                                }
-                            };
-                            counter.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    if chunk.len() >= chunk_size {
-                        let full = std::mem::replace(
-                            &mut chunk,
-                            Vec::with_capacity(chunk_size),
-                        );
-                        if !send(full) {
-                            return Ok(());
-                        }
-                    }
-                }
-                if !chunk.is_empty() {
-                    send(chunk);
-                }
-                Ok(())
-            });
-
-            let aligner = &aligner;
-            let settings = &settings;
-            let worker_handles = (0..self.threads)
-                .map(|_| {
-                    let work_rcv = work_rcv.clone();
-                    let done_snd = done_snd.clone();
-                    scope.spawn(move || {
-                        for (chunk_idx, chunk) in work_rcv {
-                            let mut out = Vec::with_capacity(chunk.len() + 8);
-                            for template in chunk {
-                                match align_read(
-                                    template.into(),
-                                    aligner,
-                                    settings,
-                                ) {
-                                    Ok(AlignOutcome::Mapped(records)) => {
-                                        counts
-                                            .mapped
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        out.extend(
-                                            records
-                                                .into_iter()
-                                                .map(SafeRecord::from),
-                                        );
-                                    }
-                                    Ok(AlignOutcome::Unmapped(record)) => {
-                                        counts
-                                            .unmapped
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        if let Some(record) = record {
-                                            out.push(SafeRecord::from(record));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        debug!("failed to align read, {e}");
-                                        counts
-                                            .failed
-                                            .fetch_add(1, Ordering::Relaxed);
-                                    }
-                                }
-                            }
-                            if done_snd.send((chunk_idx, out)).is_err() {
-                                break;
-                            }
-                        }
-                    })
-                })
-                .collect::<Vec<_>>();
-            drop(work_rcv);
-            drop(done_snd);
-
-            let ticker = &ticker;
-            let writer_handle = scope.spawn(move || -> anyhow::Result<()> {
-                let mut pending = BTreeMap::<usize, Vec<SafeRecord>>::new();
-                let mut next_idx = 0usize;
-                for (chunk_idx, records) in done_rcv {
-                    pending.insert(chunk_idx, records);
-                    while let Some(records) = pending.remove(&next_idx) {
-                        let mut n_reads = 0u64;
-                        let mut prev_name: Option<Vec<u8>> = None;
-                        for safe_record in records {
-                            let record: bam::Record = safe_record.into();
-                            if prev_name.as_deref() != Some(record.qname()) {
-                                n_reads += 1;
-                                prev_name = Some(record.qname().to_vec());
-                            }
-                            writer
-                                .write(&record)
-                                .context("failed to write output record")?;
-                            counts.records_out.fetch_add(1, Ordering::Relaxed);
-                        }
-                        ticker.inc(n_reads);
-                        next_idx += 1;
-                        // hand back the token, the reader may have exited
-                        let _ = token_snd.send(());
-                    }
-                }
-                Ok(())
-            });
-
-            for handle in worker_handles {
-                handle.join().map_err(|_| anyhow!("worker thread panicked"))?;
-            }
-            let writer_result = writer_handle
-                .join()
-                .map_err(|_| anyhow!("writer thread panicked"))?;
-            let reader_result = reader_handle
-                .join()
-                .map_err(|_| anyhow!("reader thread panicked"))?;
-            // report the most specific error first
-            writer_result?;
-            reader_result
-        })?;
-        ticker.finish_and_clear();
-
+impl Counts {
+    fn log(&self, no_unmapped: bool) {
         let get = |c: &AtomicUsize| c.load(Ordering::Relaxed);
         info!(
             "processed {} input records, {} reads aligned, {} unaligned{}, \
-             wrote {} records",
-            get(&counts.reads_in),
-            get(&counts.mapped),
-            get(&counts.unmapped),
-            if self.no_unmapped { " (not written)" } else { "" },
-            get(&counts.records_out),
+             output {} records",
+            get(&self.reads_in),
+            get(&self.mapped),
+            get(&self.unmapped),
+            if no_unmapped { " (not written)" } else { "" },
+            get(&self.records_out),
         );
-        let skipped_secondary = get(&counts.skipped_secondary_supplementary);
+        let skipped_secondary = get(&self.skipped_secondary_supplementary);
         if skipped_secondary > 0 {
             info!(
                 "skipped {skipped_secondary} secondary/supplementary input \
                  records, reads are re-aligned from their primary record"
             );
         }
-        let skipped_no_seq = get(&counts.skipped_no_seq);
+        let skipped_no_seq = get(&self.skipped_no_seq);
         if skipped_no_seq > 0 {
             warn!("skipped {skipped_no_seq} input records without a sequence");
         }
-        let skipped_hard_clipped = get(&counts.skipped_hard_clipped);
+        let skipped_hard_clipped = get(&self.skipped_hard_clipped);
         if skipped_hard_clipped > 0 {
             warn!(
                 "skipped {skipped_hard_clipped} hard-clipped primary input \
                  records, these do not contain the full read sequence"
             );
         }
-        let failed = get(&counts.failed);
+        let failed = get(&self.failed);
         if failed > 0 {
             warn!(
                 "{failed} reads failed to align due to errors, see debug log"
             );
         }
-        Ok(())
     }
+}
+
+/// Align the reads from `in_bam` (path, or `-` for stdin) and collect the
+/// aligned records in an in-memory store, sorted the same way as
+/// `samtools sort` would sort the output of `modkit modbam align`. Only the
+/// tags needed for base modification calling (MM/ML/MN) are kept.
+pub fn align_to_store(
+    in_bam: &str,
+    reference: &PathBuf,
+    preset: AlignPreset,
+    threads: usize,
+) -> anyhow::Result<AlignedRecordStore> {
+    info!(
+        "loading/building minimap2 index from {:?} with preset {:?}",
+        reference, preset
+    );
+    let aligner = build_aligner(reference, preset, threads)?;
+    let targets = aligner_targets(&aligner);
+    info!("index contains {} reference sequence(s)", targets.len());
+    let mut reader = get_serial_reader(in_bam)?;
+    reader.set_threads(threads.min(4))?;
+    let mut header = build_output_header(reader.header(), &targets)?;
+    add_modkit_pg_records(&mut header);
+    let mut builder = AlignedRecordStoreBuilder::new(
+        targets.iter().map(|(name, _)| name.clone()).collect(),
+        header.to_bytes(),
+    );
+    let settings = MapSettings {
+        secondary: false,
+        unmapped: false,
+        md: false,
+        mod_tags_only: true,
+    };
+    let mut push = |record: bam::Record| builder.push(record);
+    let counts =
+        run_alignment(reader, &aligner, &settings, threads, 32, &mut push)?;
+    counts.log(true);
+    let store = builder.finish();
+    info!(
+        "holding {} aligned records in memory (~{} MB)",
+        store.total_records(),
+        store.approx_bytes() / 1_000_000
+    );
+    Ok(store)
+}
+
+/// Reader -> alignment workers -> (re-ordering) sink. Work is sent in small
+/// chunks so that a few long reads don't leave the other workers idle. The
+/// number of chunks in flight (being aligned or waiting to be handed to the
+/// sink in order) is limited by a pool of tokens, which bounds memory use.
+/// Records reach `sink` in input order.
+fn run_alignment(
+    mut reader: bam::Reader,
+    aligner: &Aligner<Built>,
+    settings: &MapSettings,
+    threads: usize,
+    chunk_size: usize,
+    sink: &mut (dyn FnMut(bam::Record) -> anyhow::Result<()> + Send),
+) -> anyhow::Result<Counts> {
+    if threads == 0 {
+        bail!("threads must be at least 1");
+    }
+    if chunk_size == 0 {
+        bail!("batch-size must be at least 1");
+    }
+    let counts = Counts::default();
+    let ticker = get_ticker();
+    ticker.set_message("reads aligned");
+
+    let max_in_flight = threads * 8;
+    let (token_snd, token_rcv) = bounded::<()>(max_in_flight);
+    for _ in 0..max_in_flight {
+        token_snd.send(()).expect("token channel should be open");
+    }
+    let (work_snd, work_rcv) =
+        bounded::<(usize, Vec<SafeRecord>)>(max_in_flight);
+    let (done_snd, done_rcv) =
+        bounded::<(usize, Vec<SafeRecord>)>(max_in_flight);
+
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let counts = &counts;
+        let mod_tags_only = settings.mod_tags_only;
+        let reader_handle = scope.spawn(move || -> anyhow::Result<()> {
+            let mut chunk = Vec::with_capacity(chunk_size);
+            let mut chunk_idx = 0usize;
+            let mut send = |chunk: Vec<SafeRecord>| -> bool {
+                // a closed channel means downstream stopped due to an
+                // error, that error is reported by the sink.
+                if token_rcv.recv().is_err() {
+                    return false;
+                }
+                let ok = work_snd.send((chunk_idx, chunk)).is_ok();
+                chunk_idx += 1;
+                ok
+            };
+            let mut record = bam::Record::new();
+            while let Some(res) = reader.read(&mut record) {
+                res.context("failed to read input record")?;
+                counts.reads_in.fetch_add(1, Ordering::Relaxed);
+                match make_template(&record, mod_tags_only) {
+                    Ok(template) => chunk.push(SafeRecord::from(template)),
+                    Err(skip) => {
+                        let counter = match skip {
+                            Skip::SecondaryOrSupplementary => {
+                                &counts.skipped_secondary_supplementary
+                            }
+                            Skip::NoSequence => &counts.skipped_no_seq,
+                            Skip::HardClipped => &counts.skipped_hard_clipped,
+                        };
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                if chunk.len() >= chunk_size {
+                    let full = std::mem::replace(
+                        &mut chunk,
+                        Vec::with_capacity(chunk_size),
+                    );
+                    if !send(full) {
+                        return Ok(());
+                    }
+                }
+            }
+            if !chunk.is_empty() {
+                send(chunk);
+            }
+            Ok(())
+        });
+
+        let worker_handles = (0..threads)
+            .map(|_| {
+                let work_rcv = work_rcv.clone();
+                let done_snd = done_snd.clone();
+                scope.spawn(move || {
+                    for (chunk_idx, chunk) in work_rcv {
+                        let mut out = Vec::with_capacity(chunk.len() + 8);
+                        for template in chunk {
+                            match align_read(template.into(), aligner, settings)
+                            {
+                                Ok(AlignOutcome::Mapped(records)) => {
+                                    counts
+                                        .mapped
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    out.extend(
+                                        records
+                                            .into_iter()
+                                            .map(SafeRecord::from),
+                                    );
+                                }
+                                Ok(AlignOutcome::Unmapped(record)) => {
+                                    counts
+                                        .unmapped
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    if let Some(record) = record {
+                                        out.push(SafeRecord::from(record));
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("failed to align read, {e}");
+                                    counts
+                                        .failed
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        if done_snd.send((chunk_idx, out)).is_err() {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(work_rcv);
+        drop(done_snd);
+
+        let ticker = &ticker;
+        let sink_handle = scope.spawn(move || -> anyhow::Result<()> {
+            let mut pending = BTreeMap::<usize, Vec<SafeRecord>>::new();
+            let mut next_idx = 0usize;
+            for (chunk_idx, records) in done_rcv {
+                pending.insert(chunk_idx, records);
+                while let Some(records) = pending.remove(&next_idx) {
+                    let mut n_reads = 0u64;
+                    let mut prev_name: Option<Vec<u8>> = None;
+                    for safe_record in records {
+                        let record: bam::Record = safe_record.into();
+                        if prev_name.as_deref() != Some(record.qname()) {
+                            n_reads += 1;
+                            prev_name = Some(record.qname().to_vec());
+                        }
+                        sink(record)?;
+                        counts.records_out.fetch_add(1, Ordering::Relaxed);
+                    }
+                    ticker.inc(n_reads);
+                    next_idx += 1;
+                    // hand back the token, the reader may have exited
+                    let _ = token_snd.send(());
+                }
+            }
+            Ok(())
+        });
+
+        for handle in worker_handles {
+            handle.join().map_err(|_| anyhow!("worker thread panicked"))?;
+        }
+        let sink_result = sink_handle
+            .join()
+            .map_err(|_| anyhow!("output thread panicked"))?;
+        let reader_result = reader_handle
+            .join()
+            .map_err(|_| anyhow!("reader thread panicked"))?;
+        // report the most specific error first
+        sink_result?;
+        reader_result
+    })?;
+    ticker.finish_and_clear();
+    Ok(counts)
 }
 
 fn build_aligner(
@@ -484,7 +553,10 @@ enum Skip {
 
 /// Make an unaligned record in the original read orientation carrying all of
 /// the per-read tags from `record`.
-fn make_template(record: &bam::Record) -> Result<bam::Record, Skip> {
+fn make_template(
+    record: &bam::Record,
+    mod_tags_only: bool,
+) -> Result<bam::Record, Skip> {
     if record.is_secondary() || record.is_supplementary() {
         return Err(Skip::SecondaryOrSupplementary);
     }
@@ -518,7 +590,11 @@ fn make_template(record: &bam::Record) -> Result<bam::Record, Skip> {
         if tag == MN_TAG || ALIGNMENT_TAGS.iter().any(|t| *t == tag) {
             continue;
         }
-        has_mod_tags |= MOD_TAGS.iter().any(|t| *t == tag);
+        let is_mod_tag = MOD_TAGS.iter().any(|t| *t == tag);
+        if mod_tags_only && !is_mod_tag {
+            continue;
+        }
+        has_mod_tags |= is_mod_tag;
         // tags were read from a valid record, push cannot fail on duplicates
         // because we skip none of the input tags twice.
         let _ = template.push_aux(tag, value);
@@ -533,6 +609,8 @@ struct MapSettings {
     secondary: bool,
     unmapped: bool,
     md: bool,
+    /// only keep the base modification tags from the input records
+    mod_tags_only: bool,
 }
 
 enum AlignOutcome {

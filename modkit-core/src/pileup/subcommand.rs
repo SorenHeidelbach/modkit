@@ -15,6 +15,8 @@ use rust_htslib::bam::{self, HeaderView, Read};
 
 use modkit_logging::init_logging;
 
+use crate::align::{align_to_store, AlignPreset};
+use crate::record_source::RecordSourceSpec;
 use crate::command_utils::{
     get_motif_lookup_from_parts, get_threshold_from_options,
     parse_edge_filter_input, parse_per_base_thresholds,
@@ -62,10 +64,31 @@ use crate::writers::{
 pub struct ModBamPileup {
     // running args
     /// Input BAM, should be sorted and have associated index available.
+    /// With --align, an unaligned (or aligned) modBAM, which can also be `-`
+    /// to read from standard input.
     in_bam: PathBuf,
     /// Output file to write results into. Specify "-" or "stdout" to direct
     /// output to stdout.
     out_bed: String,
+    /// Align the reads in the input modBAM to this reference (FASTA or
+    /// minimap2 .mmi index) with the built-in minimap2 before the pileup.
+    /// The aligned reads are held in memory and piled up directly, no
+    /// aligned BAM is written, sorted or indexed. Output is the same as
+    /// running `modkit modbam align` and `samtools sort` followed by this
+    /// command on the sorted BAM. Memory use is roughly 1.5 bytes per
+    /// aligned base plus the modification tags.
+    #[clap(help_heading = "Alignment Options")]
+    #[arg(long = "align", value_name = "REFERENCE")]
+    align_reference: Option<PathBuf>,
+    /// Alignment preset used with --align, same as minimap2 `-x`.
+    #[clap(help_heading = "Alignment Options")]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = AlignPreset::MapOnt,
+        requires = "align_reference"
+    )]
+    align_preset: AlignPreset,
     /// Output bgzf-compressed bedmethyl files suitable for Tabix-indexing
     #[clap(help_heading = "Output Options")]
     #[arg(long, default_value_t = false, hide_short_help = false)]
@@ -734,6 +757,7 @@ impl ModBamPileup {
 
     fn calc_per_base_thresholds(
         &self,
+        source: &RecordSourceSpec,
         regex_motifs: Option<Vec<RegexMotif>>,
         stranded_position_filter: Option<StrandedPositionFilter<()>>,
         bam_header: &HeaderView,
@@ -810,13 +834,13 @@ impl ModBamPileup {
                 let worker = RegionMleProbs::<
                     AlignedBaseArgmaxProbs,
                     ProbsExtractor,
-                >::new(
-                    &self.in_bam,
+                >::new_from_source(
+                    source,
                     self.reference_fasta.as_ref(),
                     false,
                     motif_bases,
                     edge_filter,
-                    thread_pool,
+                    Some(thread_pool),
                     self.seed.unwrap_or(i as u64),
                     rng_sample,
                     sample_frac,
@@ -836,13 +860,13 @@ impl ModBamPileup {
                 let worker = RegionMleProbs::<
                     AlignedBaseArgmaxProbs,
                     ProbsExtractor,
-                >::new(
-                    &self.in_bam,
+                >::new_from_source(
+                    source,
                     self.reference_fasta.as_ref(),
                     false,
                     motif_bases,
                     edge_filter,
-                    thread_pool,
+                    Some(thread_pool),
                     self.seed.unwrap_or(i as u64),
                     rng_sample,
                     sample_frac,
@@ -858,13 +882,13 @@ impl ModBamPileup {
             });
             for i in 0..n_workers {
                 let worker =
-                    RegionMleProbs::<BaseArgmaxProbs, ProbsExtractor>::new(
-                        &self.in_bam,
+                    RegionMleProbs::<BaseArgmaxProbs, ProbsExtractor>::new_from_source(
+                        source,
                         self.reference_fasta.as_ref(),
                         false,
                         [DnaBase::A; 4],
                         edge_filter,
-                        thread_pool,
+                        Some(thread_pool),
                         self.seed.unwrap_or(i as u64),
                         rng_sample,
                         sample_frac,
@@ -894,6 +918,7 @@ impl ModBamPileup {
                 );
             });
             return self.calc_per_base_thresholds(
+                source,
                 regex_motifs.clone(),
                 stranded_position_filter.clone(),
                 bam_header,
@@ -937,17 +962,39 @@ impl ModBamPileup {
             bail!("filter percentile must be <= 1.0")
         }
 
-        // do this first so we fail when the file isn't readable
-        let (header, check_idx) = bam::IndexedReader::from_path(&self.in_bam)
-            .map_err(|e| e.into())
-            .and_then(|reader| {
-                let check = reader_is_bam(&reader);
-                if self.reference_fasta.is_none() && reader_is_cram(&reader) {
-                    bail!("--reference is required when using CRAM")
-                } else {
-                    Ok((reader.header().to_owned(), check))
-                }
-            })?;
+        let (header, check_idx, source) = if let Some(align_reference) =
+            self.align_reference.as_ref()
+        {
+            let store = align_to_store(
+                self.in_bam.to_str().ok_or_else(|| {
+                    anyhow!("input path {:?} is not valid UTF-8", self.in_bam)
+                })?,
+                align_reference,
+                self.align_preset,
+                self.threads,
+            )?;
+            if store.total_records() == 0 {
+                bail!("no reads aligned to {align_reference:?}")
+            }
+            let header = HeaderView::from_bytes(store.header_text());
+            (header, false, RecordSourceSpec::Store(Arc::new(store)))
+        } else {
+            // do this first so we fail when the file isn't readable
+            let (header, check_idx) =
+                bam::IndexedReader::from_path(&self.in_bam)
+                    .map_err(|e| e.into())
+                    .and_then(|reader| {
+                        let check = reader_is_bam(&reader);
+                        if self.reference_fasta.is_none()
+                            && reader_is_cram(&reader)
+                        {
+                            bail!("--reference is required when using CRAM")
+                        } else {
+                            Ok((reader.header().to_owned(), check))
+                        }
+                    })?;
+            (header, check_idx, RecordSourceSpec::Hts(self.in_bam.clone()))
+        };
 
         // options parsing below
         let region = self
@@ -1006,7 +1053,16 @@ impl ModBamPileup {
             })
             .transpose()?;
 
-        let reference_records = if check_idx {
+        let reference_records = if let RecordSourceSpec::Store(store) =
+            &source
+        {
+            // same as filtering with the BAM index: keep contigs with
+            // (any) aligned records
+            reference_records
+                .into_iter()
+                .filter(|r| store.n_records(r.tid) > 0)
+                .collect()
+        } else if check_idx {
             filter_reference_records(
                 reference_records,
                 &self.in_bam,
@@ -1239,6 +1295,7 @@ impl ModBamPileup {
                 (
                     0f32,
                     self.calc_per_base_thresholds(
+                        &source,
                         regex_motifs.clone(),
                         position_filter.clone(),
                         &header,
@@ -1251,7 +1308,6 @@ impl ModBamPileup {
                     )?,
                 )
             };
-        let in_bam_fp = self.in_bam.clone();
         let per_mod_thresholds = per_mod_thresholds
             .map(|x| {
                 x.into_iter()
@@ -1290,7 +1346,7 @@ impl ModBamPileup {
                             1,
                             false,
                         >::new(
-                            &in_bam_fp,
+                            &source,
                             ref_fasta,
                             self.phased,
                             base_thresholds,
@@ -1337,7 +1393,7 @@ impl ModBamPileup {
                             2,
                             false,
                         >::new(
-                            &in_bam_fp,
+                            &source,
                             ref_fasta,
                             self.phased,
                             base_thresholds,
@@ -1381,7 +1437,7 @@ impl ModBamPileup {
                                 2,
                                 false,
                             >::new(
-                                &in_bam_fp,
+                                &source,
                                 ref_fasta,
                                 self.phased,
                                 base_thresholds,
@@ -1449,7 +1505,7 @@ impl ModBamPileup {
                             1,
                             true,
                         >::new(
-                            &in_bam_fp,
+                            &source,
                             ref_fasta,
                             self.phased,
                             base_thresholds,
@@ -1470,7 +1526,7 @@ impl ModBamPileup {
                             2,
                             true,
                         >::new(
-                            &in_bam_fp,
+                            &source,
                             ref_fasta,
                             self.phased,
                             base_thresholds,
@@ -1504,7 +1560,7 @@ impl ModBamPileup {
                 let xs = (0..self.threads)
                     .map(|_| {
                         GenericPileupWorker::new(
-                            &self.in_bam,
+                            &source,
                             self.reference_fasta.as_ref(),
                             motif_infos.clone(),
                             default_threshold,

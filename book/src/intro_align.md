@@ -33,3 +33,16 @@ The command does the same thing as the common pipeline, but avoids its pitfalls:
 
 Reads that don't align are written as unmapped records (with their tags) unless `--no-unmapped` is passed.
 Paired-end reads aren't supported.
+
+## Aligning and piling up in one step
+
+If the goal is a bedMethyl table, `modkit pileup --align` aligns the reads and piles them up without writing, sorting, indexing and re-reading an aligned BAM:
+
+```bash
+modkit pileup --align reference.mmi --align-preset map-ont -t 8 calls.bam pileup.bed
+```
+
+All the usual `pileup` options work (`--cpg`, `--motif`, `--modified-bases`, `--combine-strands`, thresholds, ...).
+The output is identical to running `modkit modbam align`, `samtools sort` and `samtools index`, and then `modkit pileup` on the sorted BAM, including the estimated filter threshold.
+The aligned records are kept in memory (sorted the same way as `samtools sort`), roughly 1.5 bytes per aligned base plus the MM/ML tags, so this suits bacterial genomes, metagenomes, targeted data and single chromosomes better than whole human genomes at high coverage.
+No aligned BAM is produced; run `modkit modbam align` if you also need one.

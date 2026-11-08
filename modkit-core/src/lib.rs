@@ -21,6 +21,7 @@ pub mod pileup;
 pub mod position_filter;
 pub mod read_ids_to_base_mod_probs;
 pub mod reads_sampler;
+pub mod record_source;
 pub mod record_processor;
 pub mod repair_tags;
 pub mod stats;

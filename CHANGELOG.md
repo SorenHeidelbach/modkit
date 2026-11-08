@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 ### Adds
   - [modbam] Adds `modbam align`, aligns reads in a modBAM to a reference with an embedded minimap2. MM/ML and other per-read tags are kept valid on all output records (supplementary alignments are soft-clipped and `MN` is set), no FASTQ conversion needed.
+  - [pileup] Adds `--align <REFERENCE>` to align an unaligned modBAM in-process and pile up straight from memory, skipping the aligned BAM, sort and index steps. Output is identical to aligning, sorting and running `pileup` on the BAM.
 
 
 ## [v0.6.4]
